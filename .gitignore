@@ -31,3 +31,7 @@ folly/FormatTables.cpp
 folly/EscapeTables.cpp
 folly/GroupVarintTables.cpp
 folly/FingerprintTables.cpp
+folly/include
+folly/lib
+folly/src
+folly/tmp
