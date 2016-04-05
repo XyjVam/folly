@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,8 +22,7 @@
  * optimizations for use with relocatable types and jemalloc.
  */
 
-#ifndef FOLLY_FBVECTOR_H
-#define FOLLY_FBVECTOR_H
+#pragma once
 
 //=============================================================================
 // headers
@@ -36,6 +35,7 @@
 #include <type_traits>
 #include <utility>
 
+#include <folly/FormatTraits.h>
 #include <folly/Likely.h>
 #include <folly/Malloc.h>
 #include <folly/Traits.h>
@@ -163,8 +163,7 @@ private:
       }
     }
 
-    void
-    set(pointer newB, size_type newSize, size_type newCap) {
+    void set(pointer newB, size_type newSize, size_type newCap) {
       z_ = newB + newCap;
       e_ = newB + newSize;
       b_ = newB;
@@ -523,7 +522,7 @@ private:
 
   static void
   S_uninitialized_copy_bits(T* dest, const T* first, const T* last) {
-    std::memcpy(dest, first, (last - first) * sizeof(T));
+    std::memcpy((void*)dest, (void*)first, (last - first) * sizeof(T));
   }
 
   static void
@@ -531,7 +530,7 @@ private:
                        std::move_iterator<T*> last) {
     T* bFirst = first.base();
     T* bLast = last.base();
-    std::memcpy(dest, bFirst, (bLast - bFirst) * sizeof(T));
+    std::memcpy((void*)dest, (void*)bFirst, (bLast - bFirst) * sizeof(T));
   }
 
   template <typename It>
@@ -556,7 +555,7 @@ private:
 
   static const T* S_copy_n(T* dest, const T* first, size_type n) {
     if (folly::IsTriviallyCopyable<T>::value) {
-      std::memcpy(dest, first, n * sizeof(T));
+      std::memcpy((void*)dest, (void*)first, n * sizeof(T));
       return first + n;
     } else {
       return S_copy_n<const T*>(dest, first, n);
@@ -567,7 +566,7 @@ private:
   S_copy_n(T* dest, std::move_iterator<T*> mIt, size_type n) {
     if (folly::IsTriviallyCopyable<T>::value) {
       T* first = mIt.base();
-      std::memcpy(dest, first, n * sizeof(T));
+      std::memcpy((void*)dest, (void*)first, n * sizeof(T));
       return std::make_move_iterator(first + n);
     } else {
       return S_copy_n<std::move_iterator<T*>>(dest, mIt, n);
@@ -637,7 +636,7 @@ private:
   }
 
   void relocate_move_or_memcpy(T* dest, T* first, T* last, std::true_type) {
-    std::memcpy(dest, first, (last - first) * sizeof(T));
+    std::memcpy((void*)dest, (void*)first, (last - first) * sizeof(T));
   }
 
   void relocate_move_or_memcpy(T* dest, T* first, T* last, std::false_type) {
@@ -653,7 +652,7 @@ private:
   }
 
   // done
-  void relocate_done(T* dest, T* first, T* last) noexcept {
+  void relocate_done(T* /*dest*/, T* first, T* last) noexcept {
     if (folly::IsRelocatable<T>::value && usingStdAllocator::value) {
       // used memcpy; data has been relocated, do not call destructor
     } else {
@@ -965,6 +964,11 @@ public:
   }
 
   void shrink_to_fit() noexcept {
+    if (empty()) {
+      impl_.reset();
+      return;
+    }
+
     auto const newCapacityBytes = folly::goodMallocSize(size() * sizeof(T));
     auto const newCap = newCapacityBytes / sizeof(T);
     auto const oldCap = capacity();
@@ -1176,7 +1180,7 @@ public:
         if (folly::IsRelocatable<T>::value && usingStdAllocator::value) {
           D_destroy_range_a((iterator)first, (iterator)last);
           if (last - first >= cend() - last) {
-            std::memcpy((iterator)first, last, (cend() - last) * sizeof(T));
+            std::memcpy((void*)first, (void*)last, (cend() - last) * sizeof(T));
           } else {
             std::memmove((iterator)first, last, (cend() - last) * sizeof(T));
           }
@@ -1254,7 +1258,7 @@ private: // we have the private section first because it defines some macros
   // These three functions, make_window, wrap_frame, and
   //  insert_use_fresh_memory, can be combined into a uniform interface.
   // Since that interface involves a lot of case-work, it is built into
-  //  some macros: FOLLY_FBVECTOR_INSERT_(START|TRY|END)
+  //  some macros: FOLLY_FBVECTOR_INSERT_(PRE|START|TRY|END)
   // Macros are used in an attempt to let GCC perform better optimizations,
   //  especially control flow optimization.
   //
@@ -1263,10 +1267,6 @@ private: // we have the private section first because it defines some macros
   // window
 
   void make_window(iterator position, size_type n) {
-    assert(isValid(position));
-    assert(size() + n <= capacity());
-    assert(n != 0);
-
     // The result is guaranteed to be non-negative, so use an unsigned type:
     size_type tail = std::distance(position, impl_.e_);
 
@@ -1320,8 +1320,8 @@ private: // we have the private section first because it defines some macros
   //---------------------------------------------------------------------------
   // use fresh?
 
-  bool insert_use_fresh(const_iterator cposition, size_type n) {
-    if (cposition == cend()) {
+  bool insert_use_fresh(bool at_end, size_type n) {
+    if (at_end) {
       if (size() + n <= capacity()) return false;
       if (reserve_in_place(size() + n)) return false;
       return true;
@@ -1335,19 +1335,33 @@ private: // we have the private section first because it defines some macros
   //---------------------------------------------------------------------------
   // interface
 
+  #define FOLLY_FBVECTOR_INSERT_PRE(cpos, n)                                  \
+    if (n == 0) return (iterator)cpos;                                        \
+    bool at_end = cpos == cend();                                             \
+    bool fresh = insert_use_fresh(at_end, n);                                 \
+    if (!at_end) {                                                            \
+      if (!fresh) {
+
+    // check for internal data (technically not required by the standard)
+
   #define FOLLY_FBVECTOR_INSERT_START(cpos, n)                                \
-    assert(isValid(cpos));                                                    \
+      }                                                                       \
+      assert(isValid(cpos));                                                  \
+    }                                                                         \
     T* position = const_cast<T*>(cpos);                                       \
     size_type idx = std::distance(impl_.b_, position);                        \
-    bool fresh = insert_use_fresh(position, n);                               \
     T* b;                                                                     \
-    size_type newCap = 0;                                                     \
+    size_type newCap; /* intentionally uninitialized */                       \
                                                                               \
     if (fresh) {                                                              \
       newCap = computeInsertCapacity(n);                                      \
       b = M_allocate(newCap);                                                 \
     } else {                                                                  \
-      make_window(position, n);                                               \
+      if (!at_end) {                                                          \
+        make_window(position, n);                                             \
+      } else {                                                                \
+        impl_.e_ += n;                                                        \
+      }                                                                       \
       b = impl_.b_;                                                           \
     }                                                                         \
                                                                               \
@@ -1362,7 +1376,11 @@ private: // we have the private section first because it defines some macros
       if (fresh) {                                                            \
         M_deallocate(b, newCap);                                              \
       } else {                                                                \
-        undo_window(position, n);                                             \
+        if (!at_end) {                                                        \
+          undo_window(position, n);                                           \
+        } else {                                                              \
+          impl_.e_ -= n;                                                      \
+        }                                                                     \
       }                                                                       \
       throw;                                                                  \
     }                                                                         \
@@ -1392,6 +1410,7 @@ public:
 
   template <class... Args>
   iterator emplace(const_iterator cpos, Args&&... args) {
+    FOLLY_FBVECTOR_INSERT_PRE(cpos, 1)
     FOLLY_FBVECTOR_INSERT_START(cpos, 1)
       M_construct(start, std::forward<Args>(args)...);
     FOLLY_FBVECTOR_INSERT_TRY(cpos, 1)
@@ -1400,8 +1419,8 @@ public:
   }
 
   iterator insert(const_iterator cpos, const T& value) {
-    if (dataIsInternal(value)) return insert(cpos, T(value));
-
+    FOLLY_FBVECTOR_INSERT_PRE(cpos, 1)
+      if (dataIsInternal(value)) return insert(cpos, T(value));
     FOLLY_FBVECTOR_INSERT_START(cpos, 1)
       M_construct(start, value);
     FOLLY_FBVECTOR_INSERT_TRY(cpos, 1)
@@ -1410,8 +1429,8 @@ public:
   }
 
   iterator insert(const_iterator cpos, T&& value) {
-    if (dataIsInternal(value)) return insert(cpos, T(std::move(value)));
-
+    FOLLY_FBVECTOR_INSERT_PRE(cpos, 1)
+      if (dataIsInternal(value)) return insert(cpos, T(std::move(value)));
     FOLLY_FBVECTOR_INSERT_START(cpos, 1)
       M_construct(start, std::move(value));
     FOLLY_FBVECTOR_INSERT_TRY(cpos, 1)
@@ -1420,9 +1439,8 @@ public:
   }
 
   iterator insert(const_iterator cpos, size_type n, VT value) {
-    if (n == 0) return (iterator)cpos;
-    if (dataIsInternalAndNotVT(value)) return insert(cpos, n, T(value));
-
+    FOLLY_FBVECTOR_INSERT_PRE(cpos, n)
+      if (dataIsInternalAndNotVT(value)) return insert(cpos, n, T(value));
     FOLLY_FBVECTOR_INSERT_START(cpos, n)
       D_uninitialized_fill_n_a(start, n, value);
     FOLLY_FBVECTOR_INSERT_TRY(cpos, n)
@@ -1448,8 +1466,7 @@ private:
   iterator insert(const_iterator cpos, FIt first, FIt last,
                   std::forward_iterator_tag) {
     size_type n = std::distance(first, last);
-    if (n == 0) return (iterator)cpos;
-
+    FOLLY_FBVECTOR_INSERT_PRE(cpos, n)
     FOLLY_FBVECTOR_INSERT_START(cpos, n)
       D_uninitialized_copy_a(start, first, last);
     FOLLY_FBVECTOR_INSERT_TRY(cpos, n)
@@ -1586,6 +1603,16 @@ void swap(fbvector<T, A>& lhs, fbvector<T, A>& rhs) noexcept {
 //-----------------------------------------------------------------------------
 // other
 
+namespace detail {
+
+// Format support.
+template <class T, class A>
+struct IndexableTraits<fbvector<T, A>>
+  : public IndexableTraitsSeq<fbvector<T, A>> {
+};
+
+}  // namespace detail
+
 template <class T, class A>
 void compactResize(fbvector<T, A>* v, size_t sz) {
   v->resize(sz);
@@ -1631,5 +1658,3 @@ void attach(fbvector<T, A>& v, T* data, size_t sz, size_t cap) {
 }
 
 } // namespace folly
-
-#endif // FOLLY_FBVECTOR_H

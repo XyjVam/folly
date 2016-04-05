@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,6 +82,12 @@ class IPAddressV6 : boost::totally_ordered<IPAddressV6> {
   // Binary prefix for 6to4 networks
   static const uint32_t PREFIX_6TO4;
 
+  // Size of std::string returned by toFullyQualified.
+  static constexpr size_t kToFullyQualifiedSize =
+    8 /*words*/ * 4 /*hex chars per word*/ + 7 /*separators*/;
+
+  static bool validate(StringPiece ip);
+
   /**
    * Create a new IPAddress instance from the provided binary data.
    * @throws IPAddressFormatException if the input length is not 16 bytes.
@@ -90,6 +96,13 @@ class IPAddressV6 : boost::totally_ordered<IPAddressV6> {
     IPAddressV6 addr;
     addr.setFromBinary(bytes);
     return addr;
+  }
+
+  /**
+   * Returns the address as a Range.
+   */
+  ByteRange toBinary() const {
+    return ByteRange((const unsigned char *) &addr_.in6Addr_.s6_addr, 16);
   }
 
   /**

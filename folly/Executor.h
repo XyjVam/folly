@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,9 @@
 #pragma once
 
 #include <atomic>
+#include <climits>
 #include <functional>
+#include <stdexcept>
 
 namespace folly {
 
@@ -32,6 +34,21 @@ class Executor {
   /// Enqueue a function to executed by this executor. This and all
   /// variants must be threadsafe.
   virtual void add(Func) = 0;
+
+  /// Enqueue a function with a given priority, where 0 is the medium priority
+  /// This is up to the implementation to enforce
+  virtual void addWithPriority(Func, int8_t /*priority*/) {
+    throw std::runtime_error(
+        "addWithPriority() is not implemented for this Executor");
+  }
+
+  virtual uint8_t getNumPriorities() const {
+    return 1;
+  }
+
+  static const int8_t LO_PRI  = SCHAR_MIN;
+  static const int8_t MID_PRI = 0;
+  static const int8_t HI_PRI  = SCHAR_MAX;
 
   /// A convenience function for shared_ptr to legacy functors.
   ///

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,15 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_GROUPVARINT_H_
-#define FOLLY_GROUPVARINT_H_
+#pragma once
 
-#ifndef __GNUC__
-#error GroupVarint.h requires GCC
+#if !defined(__GNUC__) && !defined(_MSC_VER)
+#error GroupVarint.h requires GCC or MSVC
 #endif
 
 #include <folly/Portability.h>
 
-#if FOLLY_X64 || defined(__i386__)
+#if FOLLY_X64 || defined(__i386__) || FOLLY_PPC64
 #define HAVE_GROUP_VARINT 1
 
 #include <cstdint>
@@ -33,7 +32,7 @@
 #include <folly/Range.h>
 #include <glog/logging.h>
 
-#ifdef __SSSE3__
+#if FOLLY_SSE >= 3
 #include <x86intrin.h>
 namespace folly {
 namespace detail {
@@ -188,7 +187,7 @@ class GroupVarint<uint32_t> : public detail::GroupVarintBase<uint32_t> {
     return decode_simple(p, dest, dest+1, dest+2, dest+3);
   }
 
-#ifdef __SSSE3__
+#if FOLLY_SSE >= 3
   /**
    * Just like the non-SSSE3 decode below, but with the additional constraint
    * that we must be able to read at least 17 bytes from the input pointer, p.
@@ -214,7 +213,7 @@ class GroupVarint<uint32_t> : public detail::GroupVarintBase<uint32_t> {
     __m128i r = _mm_shuffle_epi8(val, mask);
 
     // Extracting 32 bits at a time out of an XMM register is a SSE4 feature
-#ifdef __SSE4__
+#if FOLLY_SSE >= 4
     *a = _mm_extract_epi32(r, 0);
     *b = _mm_extract_epi32(r, 1);
     *c = _mm_extract_epi32(r, 2);
@@ -512,7 +511,7 @@ class GroupVarintDecoder {
   typedef GroupVarint<T> Base;
   typedef T type;
 
-  GroupVarintDecoder() { }
+  GroupVarintDecoder() = default;
 
   explicit GroupVarintDecoder(StringPiece data,
                               size_t maxCount = (size_t)-1)
@@ -617,5 +616,4 @@ typedef GroupVarintDecoder<uint64_t> GroupVarint64Decoder;
 
 }  // namespace folly
 
-#endif /* FOLLY_X64 || defined(__i386__) */
-#endif /* FOLLY_GROUPVARINT_H_ */
+#endif /* FOLLY_X64 || defined(__i386__) || FOLLY_PPC64 */

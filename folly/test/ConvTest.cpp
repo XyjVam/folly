@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <folly/Benchmark.h>
 #include <folly/Conv.h>
 #include <folly/Foreach.h>
 #include <boost/lexical_cast.hpp>
@@ -25,17 +24,60 @@
 using namespace std;
 using namespace folly;
 
-static int8_t s8;
-static uint8_t u8;
-static int16_t s16;
-static uint16_t u16;
-static int32_t s32;
-static uint32_t u32;
-static int64_t s64;
-static uint64_t u64;
+
+TEST(Conv, digits10) {
+  char buffer[100];
+  uint64_t power;
+
+  // first, some basic sniff tests
+  EXPECT_EQ( 1, digits10(0));
+  EXPECT_EQ( 1, digits10(1));
+  EXPECT_EQ( 1, digits10(9));
+  EXPECT_EQ( 2, digits10(10));
+  EXPECT_EQ( 2, digits10(99));
+  EXPECT_EQ( 3, digits10(100));
+  EXPECT_EQ( 3, digits10(999));
+  EXPECT_EQ( 4, digits10(1000));
+  EXPECT_EQ( 4, digits10(9999));
+  EXPECT_EQ(20, digits10(18446744073709551615ULL));
+
+  // try the first X nonnegatives.
+  // Covers some more cases of 2^p, 10^p
+  for (uint64_t i = 0; i < 100000; i++) {
+    snprintf(buffer, sizeof(buffer), "%" PRIu64, i);
+    EXPECT_EQ(strlen(buffer), digits10(i));
+  }
+
+  // try powers of 2
+  power = 1;
+  for (int p = 0; p < 64; p++) {
+    snprintf(buffer, sizeof(buffer), "%" PRIu64, power);
+    EXPECT_EQ(strlen(buffer), digits10(power));
+    snprintf(buffer, sizeof(buffer), "%" PRIu64, power - 1);
+    EXPECT_EQ(strlen(buffer), digits10(power - 1));
+    snprintf(buffer, sizeof(buffer), "%" PRIu64, power + 1);
+    EXPECT_EQ(strlen(buffer), digits10(power + 1));
+    power *= 2;
+  }
+
+  // try powers of 10
+  power = 1;
+  for (int p = 0; p < 20; p++) {
+    snprintf(buffer, sizeof(buffer), "%" PRIu64, power);
+    EXPECT_EQ(strlen(buffer), digits10(power));
+    snprintf(buffer, sizeof(buffer), "%" PRIu64, power - 1);
+    EXPECT_EQ(strlen(buffer), digits10(power - 1));
+    snprintf(buffer, sizeof(buffer), "%" PRIu64, power + 1);
+    EXPECT_EQ(strlen(buffer), digits10(power + 1));
+    power *= 10;
+  }
+}
 
 // Test to<T>(T)
 TEST(Conv, Type2Type) {
+  bool boolV = true;
+  EXPECT_EQ(to<bool>(boolV), true);
+
   int intV = 42;
   EXPECT_EQ(to<int>(intV), 42);
 
@@ -55,6 +97,7 @@ TEST(Conv, Type2Type) {
   EXPECT_EQ(to<folly::StringPiece>(spV), "StringPiece");
 
   // Rvalues
+  EXPECT_EQ(to<bool>(true), true);
   EXPECT_EQ(to<int>(42), 42);
   EXPECT_EQ(to<float>(4.2f), 4.2f);
   EXPECT_EQ(to<double>(.42), .42);
@@ -66,7 +109,7 @@ TEST(Conv, Type2Type) {
 
 TEST(Conv, Integral2Integral) {
   // Same size, different signs
-  s64 = numeric_limits<uint8_t>::max();
+  int64_t s64 = numeric_limits<uint8_t>::max();
   EXPECT_EQ(to<uint8_t>(s64), s64);
 
   s64 = numeric_limits<int8_t>::max();
@@ -586,6 +629,7 @@ TEST(Conv, DoubleToInt) {
   EXPECT_EQ(i, 42);
   try {
     auto i = to<int>(42.1);
+    LOG(ERROR) << "to<int> returned " << i << " instead of throwing";
     EXPECT_TRUE(false);
   } catch (std::range_error& e) {
     //LOG(INFO) << e.what();
@@ -600,7 +644,9 @@ TEST(Conv, EnumToInt) {
   EXPECT_EQ(j, 42);
   try {
     auto i = to<char>(y);
-    LOG(ERROR) << static_cast<unsigned int>(i);
+    LOG(ERROR) << "to<char> returned "
+               << static_cast<unsigned int>(i)
+               << " instead of throwing";
     EXPECT_TRUE(false);
   } catch (std::range_error& e) {
     //LOG(INFO) << e.what();
@@ -623,6 +669,9 @@ TEST(Conv, IntToEnum) {
   EXPECT_EQ(j, 100);
   try {
     auto i = to<A>(5000000000L);
+    LOG(ERROR) << "to<A> returned "
+               << static_cast<unsigned int>(i)
+               << " instead of throwing";
     EXPECT_TRUE(false);
   } catch (std::range_error& e) {
     //LOG(INFO) << e.what();
@@ -639,14 +688,11 @@ TEST(Conv, UnsignedEnum) {
   EXPECT_EQ(e, x);
   try {
     auto i = to<int32_t>(x);
-    LOG(ERROR) << to<uint32_t>(x);
+    LOG(ERROR) << "to<int32_t> returned " << i << " instead of throwing";
     EXPECT_TRUE(false);
   } catch (std::range_error& e) {
   }
 }
-
-#if defined(__clang__) || __GNUC_PREREQ(4, 7)
-// to<enum class> and to(enum class) only supported in gcc 4.7 onwards
 
 TEST(Conv, UnsignedEnumClass) {
   enum class E : uint32_t { x = 3000000000U };
@@ -659,7 +705,7 @@ TEST(Conv, UnsignedEnumClass) {
   EXPECT_EQ(e, E::x);
   try {
     auto i = to<int32_t>(E::x);
-    LOG(ERROR) << to<uint32_t>(E::x);
+    LOG(ERROR) << "to<int32_t> returned " << i << " instead of throwing";
     EXPECT_TRUE(false);
   } catch (std::range_error& e) {
   }
@@ -674,7 +720,16 @@ TEST(Conv, EnumClassToString) {
   EXPECT_EQ("foo.65", to<string>("foo.", A::z));
 }
 
-#endif // gcc 4.7 onwards
+TEST(Conv, IntegralToBool) {
+  EXPECT_FALSE(to<bool>(0));
+  EXPECT_FALSE(to<bool>(0ul));
+
+  EXPECT_TRUE(to<bool>(1));
+  EXPECT_TRUE(to<bool>(1ul));
+
+  EXPECT_TRUE(to<bool>(-42));
+  EXPECT_TRUE(to<bool>(42ul));
+}
 
 template<typename Src>
 void testStr2Bool() {
@@ -792,330 +847,4 @@ TEST(Conv, allocate_size) {
   std::string res3;
   toAppendDelimFit(",", str1, str2, &res3);
   EXPECT_EQ(res3, str1 + "," + str2);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Benchmarks for ASCII to int conversion
-////////////////////////////////////////////////////////////////////////////////
-// @author: Rajat Goel (rajat)
-
-static int64_t handwrittenAtoi(const char* start, const char* end) {
-
-  bool positive = true;
-  int64_t retVal = 0;
-
-  if (start == end) {
-    throw std::runtime_error("empty string");
-  }
-
-  while (start < end && isspace(*start)) {
-    ++start;
-  }
-
-  switch (*start) {
-    case '-':
-      positive = false;
-    case '+':
-      ++start;
-    default:;
-  }
-
-  while (start < end && *start >= '0' && *start <= '9') {
-    auto const newRetVal = retVal * 10 + (*start++ - '0');
-    if (newRetVal < retVal) {
-      throw std::runtime_error("overflow");
-    }
-    retVal = newRetVal;
-  }
-
-  if (start != end) {
-    throw std::runtime_error("extra chars at the end");
-  }
-
-  return positive ? retVal : -retVal;
-}
-
-static StringPiece pc1 = "1234567890123456789";
-
-void handwrittenAtoiMeasure(unsigned int n, unsigned int digits) {
-  auto p = pc1.subpiece(pc1.size() - digits, digits);
-  FOR_EACH_RANGE (i, 0, n) {
-    doNotOptimizeAway(handwrittenAtoi(p.begin(), p.end()));
-  }
-}
-
-void follyAtoiMeasure(unsigned int n, unsigned int digits) {
-  auto p = pc1.subpiece(pc1.size() - digits, digits);
-  FOR_EACH_RANGE (i, 0, n) {
-    doNotOptimizeAway(folly::to<int64_t>(p.begin(), p.end()));
-  }
-}
-
-void clibAtoiMeasure(unsigned int n, unsigned int digits) {
-  auto p = pc1.subpiece(pc1.size() - digits, digits);
-  assert(*p.end() == 0);
-  static_assert(sizeof(long) == 8, "64-bit long assumed");
-  FOR_EACH_RANGE (i, 0, n) {
-    doNotOptimizeAway(atol(p.begin()));
-  }
-}
-
-void clibStrtoulMeasure(unsigned int n, unsigned int digits) {
-  auto p = pc1.subpiece(pc1.size() - digits, digits);
-  assert(*p.end() == 0);
-  char * endptr;
-  FOR_EACH_RANGE (i, 0, n) {
-    doNotOptimizeAway(strtoul(p.begin(), &endptr, 10));
-  }
-}
-
-void lexicalCastMeasure(unsigned int n, unsigned int digits) {
-  auto p = pc1.subpiece(pc1.size() - digits, digits);
-  assert(*p.end() == 0);
-  FOR_EACH_RANGE (i, 0, n) {
-    doNotOptimizeAway(boost::lexical_cast<uint64_t>(p.begin()));
-  }
-}
-
-// Benchmarks for unsigned to string conversion, raw
-
-unsigned u64ToAsciiTable(uint64_t value, char* dst) {
-  static const char digits[201] =
-    "00010203040506070809"
-    "10111213141516171819"
-    "20212223242526272829"
-    "30313233343536373839"
-    "40414243444546474849"
-    "50515253545556575859"
-    "60616263646566676869"
-    "70717273747576777879"
-    "80818283848586878889"
-    "90919293949596979899";
-
-  uint32_t const length = digits10(value);
-  uint32_t next = length - 1;
-  while (value >= 100) {
-    auto const i = (value % 100) * 2;
-    value /= 100;
-    dst[next] = digits[i + 1];
-    dst[next - 1] = digits[i];
-    next -= 2;
-  }
-  // Handle last 1-2 digits
-  if (value < 10) {
-    dst[next] = '0' + uint32_t(value);
-  } else {
-    auto i = uint32_t(value) * 2;
-    dst[next] = digits[i + 1];
-    dst[next - 1] = digits[i];
-  }
-  return length;
-}
-
-void u64ToAsciiTableBM(unsigned int n, uint64_t value) {
-  // This is too fast, need to do 10 times per iteration
-  char buf[20];
-  FOR_EACH_RANGE (i, 0, n) {
-    doNotOptimizeAway(u64ToAsciiTable(value + n, buf));
-  }
-}
-
-unsigned u64ToAsciiClassic(uint64_t value, char* dst) {
-  // Write backwards.
-  char* next = (char*)dst;
-  char* start = next;
-  do {
-    *next++ = '0' + (value % 10);
-    value /= 10;
-  } while (value != 0);
-  unsigned length = next - start;
-
-  // Reverse in-place.
-  next--;
-  while (next > start) {
-    char swap = *next;
-    *next = *start;
-    *start = swap;
-    next--;
-    start++;
-  }
-  return length;
-}
-
-void u64ToAsciiClassicBM(unsigned int n, uint64_t value) {
-  // This is too fast, need to do 10 times per iteration
-  char buf[20];
-  FOR_EACH_RANGE (i, 0, n) {
-    doNotOptimizeAway(u64ToAsciiClassic(value + n, buf));
-  }
-}
-
-void u64ToAsciiFollyBM(unsigned int n, uint64_t value) {
-  // This is too fast, need to do 10 times per iteration
-  char buf[20];
-  FOR_EACH_RANGE (i, 0, n) {
-    doNotOptimizeAway(uint64ToBufferUnsafe(value + n, buf));
-  }
-}
-
-// Benchmark uitoa with string append
-
-void u2aAppendClassicBM(unsigned int n, uint64_t value) {
-  string s;
-  FOR_EACH_RANGE (i, 0, n) {
-    // auto buf = &s.back() + 1;
-    char buffer[20];
-    s.append(buffer, u64ToAsciiClassic(value, buffer));
-    doNotOptimizeAway(s.size());
-  }
-}
-
-void u2aAppendFollyBM(unsigned int n, uint64_t value) {
-  string s;
-  FOR_EACH_RANGE (i, 0, n) {
-    // auto buf = &s.back() + 1;
-    char buffer[20];
-    s.append(buffer, uint64ToBufferUnsafe(value, buffer));
-    doNotOptimizeAway(s.size());
-  }
-}
-
-template <class String>
-struct StringIdenticalToBM {
-  StringIdenticalToBM() {}
-  void operator()(unsigned int n, size_t len) const {
-    String s;
-    BENCHMARK_SUSPEND { s.append(len, '0'); }
-    FOR_EACH_RANGE (i, 0, n) {
-      String result = to<String>(s);
-      doNotOptimizeAway(result.size());
-    }
-  }
-};
-
-template <class String>
-struct StringVariadicToBM {
-  StringVariadicToBM() {}
-  void operator()(unsigned int n, size_t len) const {
-    String s;
-    BENCHMARK_SUSPEND { s.append(len, '0'); }
-    FOR_EACH_RANGE (i, 0, n) {
-      String result = to<String>(s, nullptr);
-      doNotOptimizeAway(result.size());
-    }
-  }
-};
-
-static size_t bigInt = 11424545345345;
-static size_t smallInt = 104;
-static char someString[] = "this is some nice string";
-static char otherString[] = "this is a long string, so it's not so nice";
-static char reallyShort[] = "meh";
-static std::string stdString = "std::strings are very nice";
-static float fValue = 1.2355;
-static double dValue = 345345345.435;
-
-BENCHMARK(preallocateTestNoFloat, n) {
-  for (size_t i = 0; i < n; ++i) {
-    auto val1 = to<std::string>(bigInt, someString, stdString, otherString);
-    auto val3 = to<std::string>(reallyShort, smallInt);
-    auto val2 = to<std::string>(bigInt, stdString);
-    auto val4 = to<std::string>(bigInt, stdString, dValue, otherString);
-    auto val5 = to<std::string>(bigInt, someString, reallyShort);
-  }
-}
-
-BENCHMARK(preallocateTestFloat, n) {
-  for (size_t i = 0; i < n; ++i) {
-    auto val1 = to<std::string>(stdString, ',', fValue, dValue);
-    auto val2 = to<std::string>(stdString, ',', dValue);
-  }
-}
-BENCHMARK_DRAW_LINE();
-
-static const StringIdenticalToBM<std::string> stringIdenticalToBM;
-static const StringVariadicToBM<std::string> stringVariadicToBM;
-static const StringIdenticalToBM<fbstring> fbstringIdenticalToBM;
-static const StringVariadicToBM<fbstring> fbstringVariadicToBM;
-
-#define DEFINE_BENCHMARK_GROUP(n)                       \
-  BENCHMARK_PARAM(u64ToAsciiClassicBM, n);              \
-  BENCHMARK_RELATIVE_PARAM(u64ToAsciiTableBM, n);       \
-  BENCHMARK_RELATIVE_PARAM(u64ToAsciiFollyBM, n);       \
-  BENCHMARK_DRAW_LINE();
-
-DEFINE_BENCHMARK_GROUP(1);
-DEFINE_BENCHMARK_GROUP(12);
-DEFINE_BENCHMARK_GROUP(123);
-DEFINE_BENCHMARK_GROUP(1234);
-DEFINE_BENCHMARK_GROUP(12345);
-DEFINE_BENCHMARK_GROUP(123456);
-DEFINE_BENCHMARK_GROUP(1234567);
-DEFINE_BENCHMARK_GROUP(12345678);
-DEFINE_BENCHMARK_GROUP(123456789);
-DEFINE_BENCHMARK_GROUP(1234567890);
-DEFINE_BENCHMARK_GROUP(12345678901);
-DEFINE_BENCHMARK_GROUP(123456789012);
-DEFINE_BENCHMARK_GROUP(1234567890123);
-DEFINE_BENCHMARK_GROUP(12345678901234);
-DEFINE_BENCHMARK_GROUP(123456789012345);
-DEFINE_BENCHMARK_GROUP(1234567890123456);
-DEFINE_BENCHMARK_GROUP(12345678901234567);
-DEFINE_BENCHMARK_GROUP(123456789012345678);
-DEFINE_BENCHMARK_GROUP(1234567890123456789);
-DEFINE_BENCHMARK_GROUP(12345678901234567890U);
-
-#undef DEFINE_BENCHMARK_GROUP
-
-#define DEFINE_BENCHMARK_GROUP(n)                       \
-  BENCHMARK_PARAM(clibAtoiMeasure, n);                  \
-  BENCHMARK_RELATIVE_PARAM(lexicalCastMeasure, n);      \
-  BENCHMARK_RELATIVE_PARAM(handwrittenAtoiMeasure, n);  \
-  BENCHMARK_RELATIVE_PARAM(follyAtoiMeasure, n);        \
-  BENCHMARK_DRAW_LINE();
-
-DEFINE_BENCHMARK_GROUP(1);
-DEFINE_BENCHMARK_GROUP(2);
-DEFINE_BENCHMARK_GROUP(3);
-DEFINE_BENCHMARK_GROUP(4);
-DEFINE_BENCHMARK_GROUP(5);
-DEFINE_BENCHMARK_GROUP(6);
-DEFINE_BENCHMARK_GROUP(7);
-DEFINE_BENCHMARK_GROUP(8);
-DEFINE_BENCHMARK_GROUP(9);
-DEFINE_BENCHMARK_GROUP(10);
-DEFINE_BENCHMARK_GROUP(11);
-DEFINE_BENCHMARK_GROUP(12);
-DEFINE_BENCHMARK_GROUP(13);
-DEFINE_BENCHMARK_GROUP(14);
-DEFINE_BENCHMARK_GROUP(15);
-DEFINE_BENCHMARK_GROUP(16);
-DEFINE_BENCHMARK_GROUP(17);
-DEFINE_BENCHMARK_GROUP(18);
-DEFINE_BENCHMARK_GROUP(19);
-
-#undef DEFINE_BENCHMARK_GROUP
-
-#define DEFINE_BENCHMARK_GROUP(T, n)                    \
-  BENCHMARK_PARAM(T ## VariadicToBM, n);                \
-  BENCHMARK_RELATIVE_PARAM(T ## IdenticalToBM, n);      \
-  BENCHMARK_DRAW_LINE();
-
-DEFINE_BENCHMARK_GROUP(string, 32);
-DEFINE_BENCHMARK_GROUP(string, 1024);
-DEFINE_BENCHMARK_GROUP(string, 32768);
-DEFINE_BENCHMARK_GROUP(fbstring, 32);
-DEFINE_BENCHMARK_GROUP(fbstring, 1024);
-DEFINE_BENCHMARK_GROUP(fbstring, 32768);
-
-#undef DEFINE_BENCHMARK_GROUP
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
-  auto ret = RUN_ALL_TESTS();
-  if (!ret && FLAGS_benchmark) {
-    folly::runBenchmarks();
-  }
-  return ret;
 }

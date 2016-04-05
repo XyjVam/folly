@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,20 +16,23 @@
 
 #include <folly/small_vector.h>
 
-#include <gtest/gtest.h>
-#include <string>
-#include <memory>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include <boost/algorithm/string.hpp>
+#include <gtest/gtest.h>
 
 #include <folly/Conv.h>
 
 using folly::small_vector;
 using namespace folly::small_vector_policy;
 
-#if FOLLY_X64
+#if FOLLY_X64 || FOLLY_PPC64
 
 static_assert(sizeof(small_vector<int>) == 16,
               "Object size is not what we expect for small_vector<int>");
@@ -68,9 +71,7 @@ struct NontrivialType {
     ++ctored;
   }
 
-  NontrivialType(NontrivialType const& s) {
-    ++ctored;
-  }
+  NontrivialType(NontrivialType const& /* s */) { ++ctored; }
 
   NontrivialType& operator=(NontrivialType const& o) {
     a = o.a;
@@ -113,7 +114,7 @@ struct Thrower {
     --alive;
   }
 
-  Thrower& operator=(Thrower const& other) {
+  Thrower& operator=(Thrower const& /* other */) {
     EXPECT_EQ(magic, kMagic);
     MaybeThrow();
     return *this;
@@ -159,7 +160,7 @@ struct TestBasicGuarantee {
   {
     throwCounter = 1000;
     for (int i = 0; i < prepopulate; ++i) {
-      vec.push_back(Thrower());
+      vec.emplace_back();
     }
   }
 
@@ -203,7 +204,7 @@ TEST(small_vector, BasicGuarantee) {
     (TestBasicGuarantee(prepop))( // parens or a mildly vexing parse :(
       1,
       [&] (folly::small_vector<Thrower,3>& v) {
-        v.push_back(Thrower());
+        v.emplace_back();
       }
     );
 
@@ -232,9 +233,9 @@ TEST(small_vector, BasicGuarantee) {
     3,
     [&] (folly::small_vector<Thrower,3>& v) {
       std::vector<Thrower> b;
-      b.push_back(Thrower());
-      b.push_back(Thrower());
-      b.push_back(Thrower());
+      b.emplace_back();
+      b.emplace_back();
+      b.emplace_back();
 
       /*
        * Apparently if you do the following initializer_list instead
@@ -251,7 +252,7 @@ TEST(small_vector, BasicGuarantee) {
     [&] (folly::small_vector<Thrower,3>& v) {
       std::vector<Thrower> b;
       for (int i = 0; i < 6; ++i) {
-        b.push_back(Thrower());
+        b.emplace_back();
       }
 
       v.insert(v.begin() + 1, b.begin(), b.end());
@@ -269,7 +270,7 @@ TEST(small_vector, BasicGuarantee) {
 
 // Run this with.
 // MALLOC_CONF=prof_leak:true
-// LD_PRELOAD=${JEMALLOC_PATH}/lib/libjemalloc.so.1
+// LD_PRELOAD=${JEMALLOC_PATH}/lib/libjemalloc.so.2
 // LD_PRELOAD="$LD_PRELOAD:"${UNWIND_PATH}/lib/libunwind.so.7
 TEST(small_vector, leak_test) {
   for (int j = 0; j < 1000; ++j) {
@@ -660,7 +661,7 @@ TEST(small_vector, Capacity) {
 
   // Test capacity heapifying logic
   folly::small_vector<unsigned char, 1> vec3;
-  const size_t hc_size = 1000000;
+  const size_t hc_size = 100000;
   for (size_t i = 0; i < hc_size; ++i) {
     auto v = (unsigned char)i;
     vec3.push_back(v);
@@ -731,5 +732,103 @@ TEST(small_vector, SelfInsert) {
 
     EXPECT_EQ(vec[i-1], "abc");
     EXPECT_EQ(vec[i], "abc");
+  }
+}
+
+struct CheckedInt {
+  static const int DEFAULT_VALUE = (int)0xdeadbeef;
+  CheckedInt(): value(DEFAULT_VALUE) {}
+  explicit CheckedInt(int value): value(value) {}
+  CheckedInt(const CheckedInt& rhs): value(rhs.value) {}
+  CheckedInt(CheckedInt&& rhs) noexcept: value(rhs.value) {
+    rhs.value = DEFAULT_VALUE;
+  }
+  CheckedInt& operator= (const CheckedInt& rhs) {
+    value = rhs.value;
+    return *this;
+  }
+  CheckedInt& operator= (CheckedInt&& rhs) noexcept {
+    value = rhs.value;
+    rhs.value = DEFAULT_VALUE;
+    return *this;
+  }
+  ~CheckedInt() {}
+  int value;
+};
+
+TEST(small_vector, LVEmplaceInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(1));
+  for (int i = 1; i < 20; ++i) {
+    v.emplace_back(v[0]);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, CLVEmplaceInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  const folly::small_vector<CheckedInt>& cv = v;
+  v.push_back(CheckedInt(1));
+  for (int i = 1; i < 20; ++i) {
+    v.emplace_back(cv[0]);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, RVEmplaceInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(0));
+  for (int i = 1; i < 20; ++i) {
+    v[0] = CheckedInt(1);
+    v.emplace_back(std::move(v[0]));
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, LVPushValueInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(1));
+  for (int i = 1; i < 20; ++i) {
+    v.push_back(v[0]);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, RVPushValueInsideVector) {
+  folly::small_vector<CheckedInt> v;
+  v.push_back(CheckedInt(0));
+  for (int i = 1; i < 20; ++i) {
+    v[0] = CheckedInt(1);
+    v.push_back(v[0]);
+    ASSERT_EQ(1, v.back().value);
+  }
+}
+
+TEST(small_vector, EmplaceIterCtor) {
+  std::vector<int*> v{new int(1), new int(2)};
+  std::vector<std::unique_ptr<int>> uv(v.begin(), v.end());
+
+  std::vector<int*> w{new int(1), new int(2)};
+  small_vector<std::unique_ptr<int>> uw(w.begin(), w.end());
+}
+
+TEST(small_vector, InputIterator) {
+  std::vector<int> expected{125, 320, 512, 750, 333};
+  std::string values = "125 320 512 750 333";
+  std::istringstream is1(values);
+  std::istringstream is2(values);
+
+  std::vector<int> stdV{std::istream_iterator<int>(is1),
+                        std::istream_iterator<int>()};
+  ASSERT_EQ(stdV.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    ASSERT_EQ(stdV[i], expected[i]);
+  }
+
+  small_vector<int> smallV{std::istream_iterator<int>(is2),
+                           std::istream_iterator<int>()};
+  ASSERT_EQ(smallV.size(), expected.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    ASSERT_EQ(smallV[i], expected[i]);
   }
 }

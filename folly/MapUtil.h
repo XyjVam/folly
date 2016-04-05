@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_MAPUTIL_H_
-#define FOLLY_MAPUTIL_H_
+#pragma once
+
+#include <folly/Conv.h>
+#include <folly/Optional.h>
 
 namespace folly {
 
@@ -30,6 +32,36 @@ typename Map::mapped_type get_default(
     typename Map::mapped_type()) {
   auto pos = map.find(key);
   return (pos != map.end() ? pos->second : dflt);
+}
+
+/**
+ * Given a map and a key, return the value corresponding to the key in the map,
+ * or throw an exception of the specified type.
+ */
+template <class E = std::out_of_range, class Map>
+typename Map::mapped_type get_or_throw(
+    const Map& map, const typename Map::key_type& key,
+    const std::string& exceptionStrPrefix = std::string()) {
+  auto pos = map.find(key);
+  if (pos != map.end()) {
+    return pos->second;
+  }
+  throw E(folly::to<std::string>(exceptionStrPrefix, key));
+}
+
+/**
+ * Given a map and a key, return a Optional<V> if the key exists and None if the
+ * key does not exist in the map.
+ */
+template <class Map>
+folly::Optional<typename Map::mapped_type> get_optional(
+    const Map& map, const typename Map::key_type& key) {
+  auto pos = map.find(key);
+  if (pos != map.end()) {
+    return folly::Optional<typename Map::mapped_type>(pos->second);
+  } else {
+    return folly::none;
+  }
 }
 
 /**
@@ -67,5 +99,3 @@ typename Map::mapped_type* get_ptr(
 }
 
 }  // namespace folly
-
-#endif /* FOLLY_MAPUTIL_H_ */

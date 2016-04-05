@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,13 +52,13 @@
  * @author Tudor Bosman (tudorb@fb.com)
  */
 
-#ifndef FOLLY_BITS_H_
-#define FOLLY_BITS_H_
+#pragma once
 
-#if !defined(__clang__) && !defined(_MSC_VER)
+#if !defined(__clang__) && !(defined(_MSC_VER) && (_MSC_VER < 1900))
 #define FOLLY_INTRINSIC_CONSTEXPR constexpr
 #else
-// GCC is the only compiler with intrinsics constexpr.
+// GCC and MSVC 2015+ are the only compilers with
+// intrinsics constexpr.
 #define FOLLY_INTRINSIC_CONSTEXPR const
 #endif
 
@@ -70,14 +70,6 @@
 
 #if FOLLY_HAVE_BYTESWAP_H
 # include <byteswap.h>
-#endif
-
-#ifdef _MSC_VER
-# include <intrin.h>
-# pragma intrinsic(_BitScanForward)
-# pragma intrinsic(_BitScanForward64)
-# pragma intrinsic(_BitScanReverse)
-# pragma intrinsic(_BitScanReverse64)
 #endif
 
 #include <cassert>
@@ -100,12 +92,7 @@ typename std::enable_if<
    sizeof(T) <= sizeof(unsigned int)),
   unsigned int>::type
   findFirstSet(T x) {
-#ifdef _MSC_VER
-  unsigned long index;
-  return _BitScanForward(&index, x) ? index : 0;
-#else
   return __builtin_ffs(x);
-#endif
 }
 
 template <class T>
@@ -117,12 +104,7 @@ typename std::enable_if<
    sizeof(T) <= sizeof(unsigned long)),
   unsigned int>::type
   findFirstSet(T x) {
-#ifdef _MSC_VER
-  unsigned long index;
-  return _BitScanForward(&index, x) ? index : 0;
-#else
   return __builtin_ffsl(x);
-#endif
 }
 
 template <class T>
@@ -134,12 +116,7 @@ typename std::enable_if<
    sizeof(T) <= sizeof(unsigned long long)),
   unsigned int>::type
   findFirstSet(T x) {
-#ifdef _MSC_VER
-  unsigned long index;
-  return _BitScanForward64(&index, x) ? index : 0;
-#else
   return __builtin_ffsll(x);
-#endif
 }
 
 template <class T>
@@ -164,18 +141,7 @@ typename std::enable_if<
    sizeof(T) <= sizeof(unsigned int)),
   unsigned int>::type
   findLastSet(T x) {
-#ifdef _MSC_VER
-  unsigned long index;
-  int clz;
-  if (_BitScanReverse(&index, x)) {
-    clz = static_cast<int>(31 - index);
-  } else {
-    clz = 32;
-  }
-  return x ? 8 * sizeof(unsigned int) - clz : 0;
-#else
   return x ? 8 * sizeof(unsigned int) - __builtin_clz(x) : 0;
-#endif
 }
 
 template <class T>
@@ -187,18 +153,7 @@ typename std::enable_if<
    sizeof(T) <= sizeof(unsigned long)),
   unsigned int>::type
   findLastSet(T x) {
-#ifdef _MSC_VER
-  unsigned long index;
-  int clz;
-  if (_BitScanReverse(&index, x)) {
-    clz = static_cast<int>(31 - index);
-  } else {
-    clz = 32;
-  }
-  return x ? 8 * sizeof(unsigned int) - clz : 0;
-#else
   return x ? 8 * sizeof(unsigned long) - __builtin_clzl(x) : 0;
-#endif
 }
 
 template <class T>
@@ -210,18 +165,7 @@ typename std::enable_if<
    sizeof(T) <= sizeof(unsigned long long)),
   unsigned int>::type
   findLastSet(T x) {
-#ifdef _MSC_VER
-  unsigned long index;
-  unsigned long long clz;
-  if (_BitScanReverse(&index, x)) {
-    clz = static_cast<unsigned long long>(63 - index);
-  } else {
-    clz = 64;
-  }
-  return x ? 8 * sizeof(unsigned long long) - clz : 0;
-#else
   return x ? 8 * sizeof(unsigned long long) - __builtin_clzll(x) : 0;
-#endif
 }
 
 template <class T>
@@ -605,7 +549,13 @@ template <class T>
 inline T loadUnaligned(const void* p) {
   static_assert(sizeof(Unaligned<T>) == sizeof(T), "Invalid unaligned size");
   static_assert(alignof(Unaligned<T>) == 1, "Invalid alignment");
-  return static_cast<const Unaligned<T>*>(p)->value;
+  if (kHasUnalignedAccess) {
+    return static_cast<const Unaligned<T>*>(p)->value;
+  } else {
+    T value;
+    memcpy(&value, p, sizeof(T));
+    return value;
+  }
 }
 
 /**
@@ -615,9 +565,11 @@ template <class T>
 inline void storeUnaligned(void* p, T value) {
   static_assert(sizeof(Unaligned<T>) == sizeof(T), "Invalid unaligned size");
   static_assert(alignof(Unaligned<T>) == 1, "Invalid alignment");
-  new (p) Unaligned<T>(value);
+  if (kHasUnalignedAccess) {
+    new (p) Unaligned<T>(value);
+  } else {
+    memcpy(p, &value, sizeof(T));
+  }
 }
 
 }  // namespace folly
-
-#endif /* FOLLY_BITS_H_ */

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -176,7 +176,7 @@ TEST(StringKeyedUnorderedMapTest, constructors) {
 
   map2.emplace("key1", 1);
 
-  LeakCheckedUnorderedMap map3(move(map2));
+  LeakCheckedUnorderedMap map3(std::move(map2));
 
   EXPECT_EQ(map3.size(), 1);
   EXPECT_EQ(map3["key1"], 1);
@@ -263,7 +263,7 @@ TEST(StringKeyedSetTest, constructors) {
 
   set2.emplace("key1");
 
-  LeakCheckedSet set3(move(set2));
+  LeakCheckedSet set3(std::move(set2));
 
   EXPECT_EQ(set3.size(), 1);
   EXPECT_EQ(set3.insert("key1").second, false);
@@ -383,7 +383,7 @@ TEST(StringKeyedUnorderedSetTest, constructors) {
 
   set2.emplace("key1");
 
-  LeakCheckedUnorderedSet set3(move(set2));
+  LeakCheckedUnorderedSet set3(std::move(set2));
 
   EXPECT_EQ(set3.size(), 1);
   EXPECT_EQ(set3.insert("key1").second, false);
@@ -470,7 +470,7 @@ TEST(StringKeyedMapTest, constructors) {
 
   map2.emplace("key1", 1);
 
-  LeakCheckedMap map3(move(map2));
+  LeakCheckedMap map3(std::move(map2));
 
   EXPECT_EQ(map3.size(), 1);
   EXPECT_EQ(map3["key1"], 1);
@@ -503,7 +503,7 @@ int main(int argc, char **argv) {
   FLAGS_logtostderr = true;
   google::InitGoogleLogging(argv[0]);
   testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   return RUN_ALL_TESTS();
 }

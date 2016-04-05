@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,23 +19,41 @@
 #include <atomic>
 #include <unistd.h>
 #include <sys/time.h>
+#include <mutex>
 #include <random>
 #include <array>
 
 #include <glog/logging.h>
+#include <folly/CallOnce.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
+#include <folly/ThreadLocal.h>
+
+#ifdef _MSC_VER
+# include <wincrypt.h>
+#endif
 
 namespace folly {
 
 namespace {
 
 void readRandomDevice(void* data, size_t size) {
+#ifdef _MSC_VER
+  static folly::once_flag flag;
+  static HCRYPTPROV cryptoProv;
+  folly::call_once(flag, [&] {
+    PCHECK(CryptAcquireContext(&cryptoProv, nullptr, nullptr,
+                               PROV_RSA_FULL, 0));
+  });
+  CHECK(size <= std::numeric_limits<DWORD>::max());
+  PCHECK(CryptGenRandom(cryptoProv, (DWORD)size, (BYTE*)data));
+#else
   // Keep the random device open for the duration of the program.
   static int randomFd = ::open("/dev/urandom", O_RDONLY);
   PCHECK(randomFd >= 0);
   auto bytesRead = readFull(randomFd, data, size);
   PCHECK(bytesRead >= 0 && size_t(bytesRead) == size);
+#endif
 }
 
 class BufferedRandomDevice {
@@ -100,17 +118,17 @@ void Random::secureRandom(void* data, size_t size) {
   bufferedRandomDevice->get(data, size);
 }
 
-ThreadLocalPRNG::ThreadLocalPRNG() {
-  static folly::ThreadLocal<ThreadLocalPRNG::LocalInstancePRNG> localInstance;
-  local_ = localInstance.get();
-}
-
 class ThreadLocalPRNG::LocalInstancePRNG {
  public:
   LocalInstancePRNG() : rng(Random::create()) { }
 
   Random::DefaultGenerator rng;
 };
+
+ThreadLocalPRNG::ThreadLocalPRNG() {
+  static folly::ThreadLocal<ThreadLocalPRNG::LocalInstancePRNG> localInstance;
+  local_ = localInstance.get();
+}
 
 uint32_t ThreadLocalPRNG::getImpl(LocalInstancePRNG* local) {
   return local->rng();

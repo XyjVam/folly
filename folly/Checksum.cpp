@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,10 +29,11 @@ namespace detail {
   #define __has_builtin(x) 0
 #endif
 
-#if (__has_builtin(__builtin_ia32_crc32qi) && \
+#if __SSE4_2__ && \
+    ((__has_builtin(__builtin_ia32_crc32qi) && \
      __has_builtin(__builtin_ia32_crc32di)) || \
     (FOLLY_X64 && defined(__GNUC__) && defined(__GNUC_MINOR__) && \
-     (((__GNUC__ * 100) + __GNUC_MINOR__) >= 407))
+     (((__GNUC__ * 100) + __GNUC_MINOR__) >= 407)))
 
 // Fast SIMD implementation of CRC-32C for x86 with SSE 4.2
 uint32_t crc32c_hw(const uint8_t *data, size_t nbytes,

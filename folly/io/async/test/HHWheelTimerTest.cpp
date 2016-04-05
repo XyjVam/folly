@@ -37,14 +37,14 @@ class TestTimeout : public HHWheelTimer::Callback {
   }
 
   void timeoutExpired() noexcept override {
-    timestamps.push_back(TimePoint());
+    timestamps.emplace_back();
     if (fn) {
       fn();
     }
   }
 
   void callbackCanceled() noexcept override {
-    canceledTimestamps.push_back(TimePoint());
+    canceledTimestamps.emplace_back();
     if (fn) {
       fn();
     }
@@ -74,8 +74,6 @@ struct HHWheelTimerTest : public ::testing::Test {
  */
 TEST_F(HHWheelTimerTest, FireOnce) {
   StackWheelTimer t(&eventBase, milliseconds(1));
-
-  const HHWheelTimer::Callback* nullCallback = nullptr;
 
   TestTimeout t1;
   TestTimeout t2;
@@ -113,7 +111,6 @@ TEST_F(HHWheelTimerTest, FireOnce) {
  */
 TEST_F(HHWheelTimerTest, TestSchedulingWithinCallback) {
   StackWheelTimer t(&eventBase, milliseconds(10));
-  const HHWheelTimer::Callback* nullCallback = nullptr;
 
   TestTimeout t1;
   // Delayed to simulate the steady_clock counter lagging
@@ -268,7 +265,7 @@ TEST_F(HHWheelTimerTest, AtMostEveryN) {
   StackWheelTimer t(&eventBase, atMostEveryN);
   t.setCatchupEveryN(70);
 
-  // Create 60 timeouts to be added to ts10 at 1ms intervals.
+  // Create 60 timeouts to be added to ts1 at 1ms intervals.
   uint32_t numTimeouts = 60;
   std::vector<TestTimeout> timeouts(numTimeouts);
 
@@ -283,7 +280,7 @@ TEST_F(HHWheelTimerTest, AtMostEveryN) {
     // Call timeoutExpired() on the timeout so it will record a timestamp.
     // This is done only so we can record when we scheduled the timeout.
     // This way if ts1 starts to fall behind a little over time we will still
-    // be comparing the ts10 timeouts to when they were first scheduled (rather
+    // be comparing the ts1 timeouts to when they were first scheduled (rather
     // than when we intended to schedule them).  The scheduler may fall behind
     // eventually since we don't really schedule it once every millisecond.
     // Each time it finishes we schedule it for 1 millisecond in the future.
@@ -304,6 +301,14 @@ TEST_F(HHWheelTimerTest, AtMostEveryN) {
   TimePoint start;
   eventBase.loop();
   TimePoint end;
+
+  // This should take roughly 2*60 + 25 ms to finish. If it takes more than
+  // 250 ms to finish the system is probably heavily loaded, so skip.
+  if (std::chrono::duration_cast<std::chrono::milliseconds>(
+        end.getTime() - start.getTime()).count() > 250) {
+    LOG(WARNING) << "scheduling all timeouts takes too long";
+    return;
+  }
 
   // We scheduled timeouts 1ms apart, when the HHWheelTimer is only allowed
   // to wake up at most once every 3ms.  It will therefore wake up every 3ms
@@ -389,6 +394,41 @@ TEST_F(HHWheelTimerTest, SlowLoop) {
   T_CHECK_TIMEOUT(start2, end2, milliseconds(10), milliseconds(1));
 }
 
+/*
+ * Test scheduling a mix of timers with default timeout and variable timeout.
+ */
+TEST_F(HHWheelTimerTest, DefaultTimeout) {
+  milliseconds defaultTimeout(milliseconds(5));
+  StackWheelTimer t(&eventBase,
+                    milliseconds(1),
+                    AsyncTimeout::InternalEnum::NORMAL,
+                    defaultTimeout);
+
+  TestTimeout t1;
+  TestTimeout t2;
+
+  ASSERT_EQ(t.count(), 0);
+  ASSERT_EQ(t.getDefaultTimeout(), defaultTimeout);
+
+  t.scheduleTimeout(&t1);
+  t.scheduleTimeout(&t2, milliseconds(10));
+
+  ASSERT_EQ(t.count(), 2);
+
+  TimePoint start;
+  eventBase.loop();
+  TimePoint end;
+
+  ASSERT_EQ(t1.timestamps.size(), 1);
+  ASSERT_EQ(t2.timestamps.size(), 1);
+
+  ASSERT_EQ(t.count(), 0);
+
+  T_CHECK_TIMEOUT(start, t1.timestamps[0], defaultTimeout);
+  T_CHECK_TIMEOUT(start, t2.timestamps[0], milliseconds(10));
+  T_CHECK_TIMEOUT(start, end, milliseconds(10));
+}
+
 TEST_F(HHWheelTimerTest, lambda) {
   StackWheelTimer t(&eventBase, milliseconds(1));
   size_t count = 0;
@@ -412,4 +452,41 @@ TEST_F(HHWheelTimerTest, cancelAll) {
   t.scheduleTimeout(&tt, std::chrono::minutes(1));
   EXPECT_EQ(1, t.cancelAll());
   EXPECT_EQ(1, tt.canceledTimestamps.size());
+}
+
+TEST_F(HHWheelTimerTest, SharedPtr) {
+  HHWheelTimer::UniquePtr t(new HHWheelTimer(&eventBase, milliseconds(1)));
+
+  TestTimeout t1;
+  TestTimeout t2;
+  TestTimeout t3;
+
+  ASSERT_EQ(t->count(), 0);
+
+  t->scheduleTimeout(&t1, milliseconds(5));
+  t->scheduleTimeout(&t2, milliseconds(5));
+
+  HHWheelTimer::SharedPtr s(t);
+
+  s->scheduleTimeout(&t3, milliseconds(10));
+
+  ASSERT_EQ(t->count(), 3);
+
+  // Kill the UniquePtr, but the SharedPtr keeps it alive
+  t.reset();
+
+  TimePoint start;
+  eventBase.loop();
+  TimePoint end;
+
+  ASSERT_EQ(t1.timestamps.size(), 1);
+  ASSERT_EQ(t2.timestamps.size(), 1);
+  ASSERT_EQ(t3.timestamps.size(), 1);
+
+  ASSERT_EQ(s->count(), 0);
+
+  T_CHECK_TIMEOUT(start, t1.timestamps[0], milliseconds(5));
+  T_CHECK_TIMEOUT(start, t2.timestamps[0], milliseconds(5));
+  T_CHECK_TIMEOUT(start, t3.timestamps[0], milliseconds(10));
+  T_CHECK_TIMEOUT(start, end, milliseconds(10));
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -91,6 +91,10 @@ void AsyncServerSocket::RemoteAcceptor::messageAvailable(
   switch (msg.type) {
     case MessageType::MSG_NEW_CONN:
     {
+      if (connectionEventCallback_) {
+        connectionEventCallback_->onConnectionDequeuedByAcceptorCallback(
+            msg.fd, msg.address);
+      }
       callback_->connectionAccepted(msg.fd, msg.address);
       break;
     }
@@ -121,9 +125,7 @@ class AsyncServerSocket::BackoffTimeout : public AsyncTimeout {
   BackoffTimeout(AsyncServerSocket* socket)
       : AsyncTimeout(socket->getEventBase()), socket_(socket) {}
 
-  virtual void timeoutExpired() noexcept {
-    socket_->backoffTimeoutExpired();
-  }
+  void timeoutExpired() noexcept override { socket_->backoffTimeoutExpired(); }
 
  private:
   AsyncServerSocket* socket_;
@@ -179,10 +181,15 @@ int AsyncServerSocket::stopAccepting(int shutdownFlags) {
   }
   assert(eventBase_ == nullptr || eventBase_->isInEventBaseThread());
 
-  // When destroy is called, unregister and close the socket immediately
+  // When destroy is called, unregister and close the socket immediately.
   accepting_ = false;
 
-  for (auto& handler : sockets_) {
+  // Close the sockets in reverse order as they were opened to avoid
+  // the condition where another process concurrently tries to open
+  // the same port, succeed to bind the first socket but fails on the
+  // second because it hasn't been closed yet.
+  for (; !sockets_.empty(); sockets_.pop_back()) {
+    auto& handler = sockets_.back();
     handler.unregisterHandler();
     if (shutdownSocketSet_) {
       shutdownSocketSet_->close(handler.socket_);
@@ -193,7 +200,6 @@ int AsyncServerSocket::stopAccepting(int shutdownFlags) {
       closeNoInt(handler.socket_);
     }
   }
-  sockets_.clear();
 
   // Destroy the backoff timout.  This will cancel it if it is running.
   delete backoffTimeout_;
@@ -264,7 +270,7 @@ void AsyncServerSocket::useExistingSockets(const std::vector<int>& fds) {
     SocketAddress address;
     address.setFromLocalAddress(fd);
 
-    setupSocket(fd);
+    setupSocket(fd, address.getFamily());
     sockets_.emplace_back(eventBase_, fd, this, address.getFamily());
     sockets_.back().changeHandlerFD(fd);
   }
@@ -371,7 +377,7 @@ void AsyncServerSocket::bind(uint16_t port) {
     CHECK_GE(s, 0);
 
     try {
-      setupSocket(s);
+      setupSocket(s, res->ai_family);
     } catch (...) {
       closeNoInt(s);
       throw;
@@ -396,7 +402,7 @@ void AsyncServerSocket::bind(uint16_t port) {
     }
   };
 
-  const int kNumTries = 5;
+  const int kNumTries = 25;
   for (int tries = 1; true; tries++) {
     // Prefer AF_INET6 addresses. RFC 3484 mandates that getaddrinfo
     // should return IPv6 first and then IPv4 addresses, but glibc's
@@ -411,8 +417,7 @@ void AsyncServerSocket::bind(uint16_t port) {
     }
 
     // If port == 0, then we should try to bind to the same port on ipv4 and
-    // ipv6.  So if we did bind to ipv6, figure out that port and use it,
-    // except for the last attempt when we just use any port available.
+    // ipv6.  So if we did bind to ipv6, figure out that port and use it.
     if (sockets_.size() == 1 && port == 0) {
       SocketAddress address;
       address.setFromLocalAddress(sockets_.back().socket_);
@@ -428,9 +433,10 @@ void AsyncServerSocket::bind(uint16_t port) {
         }
       }
     } catch (const std::system_error& e) {
-      // if we can't bind to the same port on ipv4 as ipv6 when using port=0
-      // then we will try again another 2 times before giving up.  We do this
-      // by closing the sockets that were opened, then redoing the whole thing
+      // If we can't bind to the same port on ipv4 as ipv6 when using
+      // port=0 then we will retry again before giving up after
+      // kNumTries attempts.  We do this by closing the sockets that
+      // were opened, then restarting from scratch.
       if (port == 0 && !sockets_.empty() && tries != kNumTries) {
         for (const auto& socket : sockets_) {
           if (socket.socket_ <= 0) {
@@ -447,6 +453,7 @@ void AsyncServerSocket::bind(uint16_t port) {
         CHECK_EQ(0, getaddrinfo(nullptr, sport, &hints, &res0));
         continue;
       }
+
       throw;
     }
 
@@ -517,7 +524,7 @@ void AsyncServerSocket::addAcceptCallback(AcceptCallback *callback,
   // callback more efficiently without having to use a notification queue.
   RemoteAcceptor* acceptor = nullptr;
   try {
-    acceptor = new RemoteAcceptor(callback);
+    acceptor = new RemoteAcceptor(callback, connectionEventCallback_);
     acceptor->start(eventBase, maxAtOnce, maxNumMsgsInQueue_);
   } catch (...) {
     callbacks_.pop_back();
@@ -626,7 +633,7 @@ int AsyncServerSocket::createSocket(int family) {
   }
 
   try {
-    setupSocket(fd);
+    setupSocket(fd, family);
   } catch (...) {
     closeNoInt(fd);
     throw;
@@ -634,12 +641,7 @@ int AsyncServerSocket::createSocket(int family) {
   return fd;
 }
 
-void AsyncServerSocket::setupSocket(int fd) {
-  // Get the address family
-  SocketAddress address;
-  address.setFromLocalAddress(fd);
-  auto family = address.getFamily();
-
+void AsyncServerSocket::setupSocket(int fd, int family) {
   // Put the socket in non-blocking mode
   if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) {
     folly::throwSystemError(errno,
@@ -659,9 +661,15 @@ void AsyncServerSocket::setupSocket(int fd) {
       setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(int)) != 0) {
     LOG(ERROR) << "failed to set SO_REUSEPORT on async server socket "
                << strerror(errno);
+#ifdef WIN32
+    folly::throwSystemError(errno, "failed to bind to the async server socket");
+#else
+    SocketAddress address;
+    address.setFromLocalAddress(fd);
     folly::throwSystemError(errno,
                             "failed to bind to async server socket: " +
                             address.describe());
+#endif
   }
 
   // Set keepalive as desired
@@ -695,8 +703,9 @@ void AsyncServerSocket::setupSocket(int fd) {
   }
 }
 
-void AsyncServerSocket::handlerReady(
-  uint16_t events, int fd, sa_family_t addressFamily) noexcept {
+void AsyncServerSocket::handlerReady(uint16_t /* events */,
+                                     int fd,
+                                     sa_family_t addressFamily) noexcept {
   assert(!callbacks_.empty());
   DestructorGuard dg(this);
 
@@ -724,10 +733,14 @@ void AsyncServerSocket::handlerReady(
 
     address.setFromSockaddr(saddr, addrLen);
 
+    if (clientSocket >= 0 && connectionEventCallback_) {
+      connectionEventCallback_->onConnectionAccepted(clientSocket, address);
+    }
+
     std::chrono::time_point<std::chrono::steady_clock> nowMs =
       std::chrono::steady_clock::now();
-    int64_t timeSinceLastAccept = std::max(
-      int64_t(0),
+    auto timeSinceLastAccept = std::max<int64_t>(
+      0,
       nowMs.time_since_epoch().count() -
       lastAccepTimestamp_.time_since_epoch().count());
     lastAccepTimestamp_ = nowMs;
@@ -739,6 +752,10 @@ void AsyncServerSocket::handlerReady(
         ++numDroppedConnections_;
         if (clientSocket >= 0) {
           closeNoInt(clientSocket);
+          if (connectionEventCallback_) {
+            connectionEventCallback_->onConnectionDropped(clientSocket,
+                                                          address);
+          }
         }
         continue;
       }
@@ -762,6 +779,9 @@ void AsyncServerSocket::handlerReady(
       } else {
         dispatchError("accept() failed", errno);
       }
+      if (connectionEventCallback_) {
+        connectionEventCallback_->onConnectionAcceptError(errno);
+      }
       return;
     }
 
@@ -771,6 +791,9 @@ void AsyncServerSocket::handlerReady(
       closeNoInt(clientSocket);
       dispatchError("failed to set accepted socket to non-blocking mode",
                     errno);
+      if (connectionEventCallback_) {
+        connectionEventCallback_->onConnectionDropped(clientSocket, address);
+      }
       return;
     }
 #endif
@@ -797,6 +820,7 @@ void AsyncServerSocket::dispatchSocket(int socket,
     return;
   }
 
+  const SocketAddress addr(address);
   // Create a message to send over the notification queue
   QueueMessage msg;
   msg.type = MessageType::MSG_NEW_CONN;
@@ -806,9 +830,14 @@ void AsyncServerSocket::dispatchSocket(int socket,
   // Loop until we find a free queue to write to
   while (true) {
     if (info->consumer->getQueue()->tryPutMessageNoThrow(std::move(msg))) {
+      if (connectionEventCallback_) {
+        connectionEventCallback_->onConnectionEnqueuedForAcceptorCallback(
+            socket,
+            addr);
+      }
       // Success! return.
       return;
-   }
+    }
 
     // We couldn't add to queue.  Fall through to below
 
@@ -833,6 +862,9 @@ void AsyncServerSocket::dispatchSocket(int socket,
       LOG(ERROR) << "failed to dispatch newly accepted socket:"
                  << " all accept callback queues are full";
       closeNoInt(socket);
+      if (connectionEventCallback_) {
+        connectionEventCallback_->onConnectionDropped(socket, addr);
+      }
       return;
     }
 
@@ -888,6 +920,9 @@ void AsyncServerSocket::enterBackoff() {
       // since we won't be able to re-enable ourselves later.
       LOG(ERROR) << "failed to allocate AsyncServerSocket backoff"
                  << " timer; unable to temporarly pause accepting";
+      if (connectionEventCallback_) {
+        connectionEventCallback_->onBackoffError();
+      }
       return;
     }
   }
@@ -905,6 +940,9 @@ void AsyncServerSocket::enterBackoff() {
   if (!backoffTimeout_->scheduleTimeout(timeoutMS)) {
     LOG(ERROR) << "failed to schedule AsyncServerSocket backoff timer;"
                << "unable to temporarly pause accepting";
+    if (connectionEventCallback_) {
+      connectionEventCallback_->onBackoffError();
+    }
     return;
   }
 
@@ -913,6 +951,9 @@ void AsyncServerSocket::enterBackoff() {
   // since that tracks the desired state requested by the user.
   for (auto& handler : sockets_) {
     handler.unregisterHandler();
+  }
+  if (connectionEventCallback_) {
+    connectionEventCallback_->onBackoffStarted();
   }
 }
 
@@ -926,6 +967,9 @@ void AsyncServerSocket::backoffTimeoutExpired() {
 
   // If all of the callbacks were removed, we shouldn't re-enable accepts
   if (callbacks_.empty()) {
+    if (connectionEventCallback_) {
+      connectionEventCallback_->onBackoffEnded();
+    }
     return;
   }
 
@@ -943,6 +987,9 @@ void AsyncServerSocket::backoffTimeoutExpired() {
         << "crashing now";
       abort();
     }
+  }
+  if (connectionEventCallback_) {
+    connectionEventCallback_->onBackoffEnded();
   }
 }
 

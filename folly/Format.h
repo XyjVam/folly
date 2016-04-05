@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,27 +14,17 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_FORMAT_H_
+#pragma once
 #define FOLLY_FORMAT_H_
 
-#include <array>
 #include <cstdio>
 #include <tuple>
 #include <type_traits>
-#include <vector>
-#include <deque>
-#include <map>
-#include <unordered_map>
 
-#include <double-conversion/double-conversion.h>
-
-#include <folly/FBVector.h>
 #include <folly/Conv.h>
 #include <folly/Range.h>
 #include <folly/Traits.h>
-#include <folly/Likely.h>
 #include <folly/String.h>
-#include <folly/small_vector.h>
 #include <folly/FormatArg.h>
 
 // Ignore shadowing warnings within this file, so includers can use -Wshadow.
@@ -71,19 +61,6 @@ class FormatterTag {};
 template <class Derived, bool containerMode, class... Args>
 class BaseFormatter {
  public:
-  /*
-   * Change whether or not Formatter should crash or throw exceptions if the
-   * format string is invalid.
-   *
-   * Crashing is desirable for literal format strings that are fixed at compile
-   * time.  Errors in the format string are generally programmer bugs, and
-   * should be caught early on in development.  Crashing helps ensure these
-   * problems are noticed.
-   */
-  void setCrashOnError(bool crash) {
-    crashOnError_ = crash;
-  }
-
   /**
    * Append to output.  out(StringPiece sp) may be called (more than once)
    */
@@ -129,13 +106,9 @@ class BaseFormatter {
       typename std::decay<Args>::type>...> ValueTuple;
   static constexpr size_t valueCount = std::tuple_size<ValueTuple>::value;
 
-  FOLLY_NORETURN void handleFormatStrError() const;
-  template <class Output>
-  void appendOutput(Output& out) const;
-
   template <size_t K, class Callback>
   typename std::enable_if<K == valueCount>::type
-  doFormatFrom(size_t i, FormatArg& arg, Callback& cb) const {
+  doFormatFrom(size_t i, FormatArg& arg, Callback& /*cb*/) const {
     arg.error("argument index out of range, max=", i);
   }
 
@@ -154,8 +127,40 @@ class BaseFormatter {
     return doFormatFrom<0>(i, arg, cb);
   }
 
+  template <size_t K>
+  typename std::enable_if<K == valueCount, int>::type
+  getSizeArgFrom(size_t i, const FormatArg& arg) const {
+    arg.error("argument index out of range, max=", i);
+  }
+
+  template <class T>
+  typename std::enable_if<std::is_integral<T>::value &&
+                          !std::is_same<T, bool>::value, int>::type
+  getValue(const FormatValue<T>& format, const FormatArg&) const {
+    return static_cast<int>(format.getValue());
+  }
+
+  template <class T>
+  typename std::enable_if<!std::is_integral<T>::value ||
+                          std::is_same<T, bool>::value, int>::type
+  getValue(const FormatValue<T>&, const FormatArg& arg) const {
+    arg.error("dynamic field width argument must be integral");
+  }
+
+  template <size_t K>
+  typename std::enable_if<K < valueCount, int>::type
+  getSizeArgFrom(size_t i, const FormatArg& arg) const {
+    if (i == K) {
+      return getValue(std::get<K>(values_), arg);
+    }
+    return getSizeArgFrom<K+1>(i, arg);
+  }
+
+  int getSizeArg(size_t i, const FormatArg& arg) const {
+    return getSizeArgFrom<0>(i, arg);
+  }
+
   StringPiece str_;
-  bool crashOnError_{true};
 
  protected:
   explicit BaseFormatter(StringPiece str, Args&&... args);
@@ -196,12 +201,8 @@ class Formatter : public BaseFormatter<Formatter<containerMode, Args...>,
 
   template <class... A>
   friend Formatter<false, A...> format(StringPiece fmt, A&&... arg);
-  template <class... A>
-  friend Formatter<false, A...> formatChecked(StringPiece fmt, A&&... arg);
   template <class C>
   friend Formatter<true, C> vformat(StringPiece fmt, C&& container);
-  template <class C>
-  friend Formatter<true, C> vformatChecked(StringPiece fmt, C&& container);
 };
 
 /**
@@ -228,16 +229,6 @@ void writeTo(FILE* fp,
  * std::string formatted = format("{} {}", 23, 42).str();
  * LOG(INFO) << format("{} {}", 23, 42);
  * writeTo(stdout, format("{} {}", 23, 42));
- *
- * Note that format() will crash the program if the format string is invalid.
- * Normally, the format string is a fixed string literal specified by the
- * programmer.  Invalid format strings are normally programmer bugs, and should
- * be caught early on during development.  Crashing helps ensure these bugs are
- * found.
- *
- * Use formatChecked() if you have a dynamic format string (for example, a user
- * supplied value).  formatChecked() will throw an exception rather than
- * crashing the program.
  */
 template <class... Args>
 Formatter<false, Args...> format(StringPiece fmt, Args&&... args) {
@@ -252,30 +243,6 @@ Formatter<false, Args...> format(StringPiece fmt, Args&&... args) {
 template <class... Args>
 inline std::string sformat(StringPiece fmt, Args&&... args) {
   return format(fmt, std::forward<Args>(args)...).str();
-}
-
-/**
- * Create a formatter object from a dynamic format string.
- *
- * This is identical to format(), but throws an exception if the format string
- * is invalid, rather than aborting the program.  This allows it to be used
- * with user-specified format strings which are not guaranteed to be well
- * formed.
- */
-template <class... Args>
-Formatter<false, Args...> formatChecked(StringPiece fmt, Args&&... args) {
-  Formatter<false, Args...> f(fmt, std::forward<Args>(args)...);
-  f.setCrashOnError(false);
-  return f;
-}
-
-/**
- * Like formatChecked(), but immediately returns the formatted string instead of
- * an intermediate format object.
- */
-template <class... Args>
-inline std::string sformatChecked(StringPiece fmt, Args&&... args) {
-  return formatChecked(fmt, std::forward<Args>(args)...).str();
 }
 
 /**
@@ -304,31 +271,6 @@ Formatter<true, Container> vformat(StringPiece fmt, Container&& container) {
 template <class Container>
 inline std::string svformat(StringPiece fmt, Container&& container) {
   return vformat(fmt, std::forward<Container>(container)).str();
-}
-
-/**
- * Create a formatter object from a dynamic format string.
- *
- * This is identical to vformat(), but throws an exception if the format string
- * is invalid, rather than aborting the program.  This allows it to be used
- * with user-specified format strings which are not guaranteed to be well
- * formed.
- */
-template <class Container>
-Formatter<true, Container> vformatChecked(StringPiece fmt,
-                                          Container&& container) {
-  Formatter<true, Container> f(fmt, std::forward<Container>(container));
-  f.setCrashOnError(false);
-  return f;
-}
-
-/**
- * Like vformatChecked(), but immediately returns the formatted string instead
- * of an intermediate format object.
- */
-template <class Container>
-inline std::string svformatChecked(StringPiece fmt, Container&& container) {
-  return vformatChecked(fmt, std::forward<Container>(container)).str();
 }
 
 /**
@@ -370,12 +312,6 @@ format(Str* out, StringPiece fmt, Args&&... args) {
   format(fmt, std::forward<Args>(args)...).appendTo(*out);
 }
 
-template <class Str, class... Args>
-typename std::enable_if<IsSomeString<Str>::value>::type
-formatChecked(Str* out, StringPiece fmt, Args&&... args) {
-  formatChecked(fmt, std::forward<Args>(args)...).appendTo(*out);
-}
-
 /**
  * Append vformatted output to a string.
  */
@@ -383,12 +319,6 @@ template <class Str, class Container>
 typename std::enable_if<IsSomeString<Str>::value>::type
 vformat(Str* out, StringPiece fmt, Container&& container) {
   vformat(fmt, std::forward<Container>(container)).appendTo(*out);
-}
-
-template <class Str, class Container>
-typename std::enable_if<IsSomeString<Str>::value>::type
-vformatChecked(Str* out, StringPiece fmt, Container&& container) {
-  vformatChecked(fmt, std::forward<Container>(container)).appendTo(*out);
 }
 
 /**
@@ -468,10 +398,38 @@ struct IsFormatter<
         type> : public std::true_type {};
 } // folly::detail
 
+// Deprecated API. formatChecked() et. al. now behave identically to their
+// non-Checked counterparts.
+template <class... Args>
+Formatter<false, Args...> formatChecked(StringPiece fmt, Args&&... args) {
+  return format(fmt, std::forward<Args>(args)...);
+}
+template <class... Args>
+inline std::string sformatChecked(StringPiece fmt, Args&&... args) {
+  return formatChecked(fmt, std::forward<Args>(args)...).str();
+}
+template <class Container>
+Formatter<true, Container> vformatChecked(StringPiece fmt,
+                                          Container&& container) {
+  return vformat(fmt, std::forward<Container>(container));
+}
+template <class Container>
+inline std::string svformatChecked(StringPiece fmt, Container&& container) {
+  return vformatChecked(fmt, std::forward<Container>(container)).str();
+}
+template <class Str, class... Args>
+typename std::enable_if<IsSomeString<Str>::value>::type
+formatChecked(Str* out, StringPiece fmt, Args&&... args) {
+  formatChecked(fmt, std::forward<Args>(args)...).appendTo(*out);
+}
+template <class Str, class Container>
+typename std::enable_if<IsSomeString<Str>::value>::type
+vformatChecked(Str* out, StringPiece fmt, Container&& container) {
+  vformatChecked(fmt, std::forward<Container>(container)).appendTo(*out);
+}
+
 }  // namespace folly
 
 #include <folly/Format-inl.h>
 
 #pragma GCC diagnostic pop
-
-#endif /* FOLLY_FORMAT_H_ */

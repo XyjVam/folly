@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_TESTUTIL_H_
-#define FOLLY_TESTUTIL_H_
+#pragma once
 
+#include <map>
 #include <string>
 #include <folly/Range.h>
 #include <folly/experimental/io/FsUtil.h>
@@ -47,6 +47,10 @@ class TemporaryFile {
                          Scope scope = Scope::UNLINK_ON_DESTRUCTION,
                          bool closeOnDestruction = true);
   ~TemporaryFile();
+
+  // Movable, but not copiable
+  TemporaryFile(TemporaryFile&&) = default;
+  TemporaryFile& operator=(TemporaryFile&&) = default;
 
   int fd() const { return fd_; }
   const fs::path& path() const;
@@ -81,6 +85,10 @@ class TemporaryDirectory {
                               Scope scope = Scope::DELETE_ON_DESTRUCTION);
   ~TemporaryDirectory();
 
+  // Movable, but not copiable
+  TemporaryDirectory(TemporaryDirectory&&) = default;
+  TemporaryDirectory& operator=(TemporaryDirectory&&) = default;
+
   const fs::path& path() const { return path_; }
 
  private:
@@ -97,6 +105,10 @@ public:
   ChangeToTempDir();
   ~ChangeToTempDir();
 
+  // Movable, but not copiable
+  ChangeToTempDir(ChangeToTempDir&&) = default;
+  ChangeToTempDir& operator=(ChangeToTempDir&&) = default;
+
   const fs::path& path() const { return dir_.path(); }
 
 private:
@@ -104,7 +116,99 @@ private:
   TemporaryDirectory dir_;
 };
 
+/**
+ * Easy PCRE regex matching. Note that pattern must match the ENTIRE target,
+ * so use .* at the start and end of the pattern, as appropriate.  See
+ * http://regex101.com/ for a PCRE simulator.
+ */
+#define EXPECT_PCRE_MATCH(pattern_stringpiece, target_stringpiece) \
+  EXPECT_PRED2( \
+    ::folly::test::detail::hasPCREPatternMatch, \
+    pattern_stringpiece, \
+    target_stringpiece \
+  )
+#define EXPECT_NO_PCRE_MATCH(pattern_stringpiece, target_stringpiece) \
+  EXPECT_PRED2( \
+    ::folly::test::detail::hasNoPCREPatternMatch, \
+    pattern_stringpiece, \
+    target_stringpiece \
+  )
+
+namespace detail {
+  bool hasPCREPatternMatch(StringPiece pattern, StringPiece target);
+  bool hasNoPCREPatternMatch(StringPiece pattern, StringPiece target);
+}  // namespace detail
+
+/**
+ * Use these patterns together with CaptureFD and EXPECT_PCRE_MATCH() to
+ * test for the presence (or absence) of log lines at a particular level:
+ *
+ *   CaptureFD stderr(2);
+ *   LOG(INFO) << "All is well";
+ *   EXPECT_NO_PCRE_MATCH(glogErrOrWarnPattern(), stderr.readIncremental());
+ *   LOG(ERROR) << "Uh-oh";
+ *   EXPECT_PCRE_MATCH(glogErrorPattern(), stderr.readIncremental());
+ */
+inline std::string glogErrorPattern() { return ".*(^|\n)E[0-9].*"; }
+inline std::string glogWarningPattern() { return ".*(^|\n)W[0-9].*"; }
+// Error OR warning
+inline std::string glogErrOrWarnPattern() { return ".*(^|\n)[EW][0-9].*"; }
+
+/**
+ * Temporarily capture a file descriptor by redirecting it into a file.
+ * You can consume its entire output thus far via read(), incrementally
+ * via readIncremental(), or via callback using chunk_cob.
+ * Great for testing logging (see also glog*Pattern()).
+ */
+class CaptureFD {
+private:
+  struct NoOpChunkCob { void operator()(StringPiece) {} };
+public:
+  using ChunkCob = std::function<void(folly::StringPiece)>;
+
+  /**
+   * chunk_cob is is guaranteed to consume all the captured output. It is
+   * invoked on each readIncremental(), and also on FD release to capture
+   * as-yet unread lines.  Chunks can be empty.
+   */
+  explicit CaptureFD(int fd, ChunkCob chunk_cob = NoOpChunkCob());
+  ~CaptureFD();
+
+  /**
+   * Restore the captured FD to its original state. It can be useful to do
+   * this before the destructor so that you can read() the captured data and
+   * log about it to the formerly captured stderr or stdout.
+   */
+  void release();
+
+  /**
+   * Reads the whole file into a string, but does not remove the redirect.
+   */
+  std::string read() const;
+
+  /**
+   * Read any bytes that were appended to the file since the last
+   * readIncremental.  Great for testing line-by-line output.
+   */
+  std::string readIncremental();
+
+private:
+  ChunkCob chunkCob_;
+  TemporaryFile file_;
+
+  int fd_;
+  int oldFDCopy_;  // equal to fd_ after restore()
+
+  off_t readOffset_;  // for incremental reading
+};
+
+class EnvVarSaver {
+public:
+  EnvVarSaver();
+  ~EnvVarSaver();
+private:
+  std::map<std::string, std::string> saved_;
+};
+
 }  // namespace test
 }  // namespace folly
-
-#endif /* FOLLY_TESTUTIL_H_ */

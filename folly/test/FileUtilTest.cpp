@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,13 @@
 
 #include <folly/FileUtil.h>
 #include <folly/detail/FileUtilDetail.h>
+#include <folly/experimental/TestUtil.h>
 
 #include <deque>
 
 #include <glog/logging.h>
-#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
-#include <folly/Benchmark.h>
 #include <folly/Range.h>
 #include <folly/String.h>
 
@@ -83,7 +82,7 @@ ssize_t Reader::nextSize() {
   return n;
 }
 
-ssize_t Reader::operator()(int fd, void* buf, size_t count) {
+ssize_t Reader::operator()(int /* fd */, void* buf, size_t count) {
   ssize_t n = nextSize();
   if (n <= 0) {
     return n;
@@ -101,7 +100,7 @@ ssize_t Reader::operator()(int fd, void* buf, size_t count, off_t offset) {
   return operator()(fd, buf, count);
 }
 
-ssize_t Reader::operator()(int fd, const iovec* iov, int count) {
+ssize_t Reader::operator()(int /* fd */, const iovec* iov, int count) {
   ssize_t n = nextSize();
   if (n <= 0) {
     return n;
@@ -179,6 +178,7 @@ TEST_F(FileUtilTest, pread) {
 class IovecBuffers {
  public:
   explicit IovecBuffers(std::initializer_list<size_t> sizes);
+  explicit IovecBuffers(std::vector<size_t> sizes);
 
   std::vector<iovec> iov() const { return iov_; }  // yes, make a copy
   std::string join() const { return folly::join("", buffers_); }
@@ -192,6 +192,19 @@ class IovecBuffers {
 IovecBuffers::IovecBuffers(std::initializer_list<size_t> sizes) {
   iov_.reserve(sizes.size());
   for (auto& s : sizes) {
+    buffers_.push_back(std::string(s, '\0'));
+  }
+  for (auto& b : buffers_) {
+    iovec iov;
+    iov.iov_base = &b[0];
+    iov.iov_len = b.size();
+    iov_.push_back(iov);
+  }
+}
+
+IovecBuffers::IovecBuffers(std::vector<size_t> sizes) {
+  iov_.reserve(sizes.size());
+  for (auto s : sizes) {
     buffers_.push_back(std::string(s, '\0'));
   }
   for (auto& b : buffers_) {
@@ -221,6 +234,20 @@ TEST_F(FileUtilTest, readv) {
       EXPECT_EQ(in_.substr(0, p.first), buf.join().substr(0, p.first));
     }
   }
+}
+
+TEST(FileUtilTest2, wrapv) {
+  TemporaryFile tempFile("file-util-test");
+  std::vector<size_t> sizes;
+  size_t sum = 0;
+  for (int32_t i = 0; i < 1500; ++i) {
+    sizes.push_back(i % 3 + 1);
+    sum += sizes.back();
+  }
+  IovecBuffers buf(sizes);
+  ASSERT_EQ(sum, buf.size());
+  auto iov = buf.iov();
+  EXPECT_EQ(sum, wrapvFull(writev, tempFile.fd(), iov.data(), iov.size()));
 }
 
 #if FOLLY_HAVE_PREADV
@@ -279,9 +306,3 @@ TEST(String, readFile) {
 }
 
 }}  // namespaces
-
-int main(int argc, char *argv[]) {
-  testing::InitGoogleTest(&argc, argv);
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
-  return RUN_ALL_TESTS();
-}

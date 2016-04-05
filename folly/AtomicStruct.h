@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_ATOMIC_STRUCT_H_
-#define FOLLY_ATOMIC_STRUCT_H_
+#pragma once
 
 #include <atomic>
 #include <type_traits>
@@ -135,5 +134,3 @@ template <> struct AtomicStructIntPick<8> { typedef uint64_t type; };
 } // namespace detail
 
 } // namespace folly
-
-#endif

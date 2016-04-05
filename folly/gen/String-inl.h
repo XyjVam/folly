@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_GEN_STRING_H
+#ifndef FOLLY_GEN_STRING_H_
 #error This file may only be included from folly/gen/String.h
 #endif
 
@@ -231,7 +231,7 @@ class StringResplitter : public Operator<StringResplitter> {
             // The stream ended with a delimiter; our contract is to swallow
             // the final empty piece.
             if (s.empty()) {
-              return false;
+              return true;
             }
             if (s.back() != this->delimiter_) {
               return body(s);

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_BASE_STRING_H_
-#define FOLLY_BASE_STRING_H_
+#pragma once
+#define FOLLY_STRING_H_
 
 #include <exception>
+#include <stdarg.h>
 #include <string>
 #include <boost/type_traits.hpp>
+#include <boost/regex/pending/unicode_iterator.hpp>
 
 #ifdef FOLLY_HAVE_DEPRECATED_ASSOC
 #ifdef _GLIBCXX_SYMVER
@@ -363,9 +365,17 @@ fbstring errnoStr(int err);
  * defined.
  */
 inline fbstring exceptionStr(const std::exception& e) {
+#ifdef FOLLY_HAS_RTTI
   return folly::to<fbstring>(demangle(typeid(e)), ": ", e.what());
+#else
+  return folly::to<fbstring>("Exception (no RTTI available): ", e.what());
+#endif
 }
 
+// Empirically, this indicates if the runtime supports
+// std::exception_ptr, as not all (arm, for instance) do.
+#if defined(__GNUC__) && defined(__GCC_ATOMIC_INT_LOCK_FREE) && \
+  __GCC_ATOMIC_INT_LOCK_FREE > 1
 inline fbstring exceptionStr(std::exception_ptr ep) {
   try {
     std::rethrow_exception(ep);
@@ -375,13 +385,18 @@ inline fbstring exceptionStr(std::exception_ptr ep) {
     return "<unknown exception>";
   }
 }
+#endif
 
 template<typename E>
 auto exceptionStr(const E& e)
   -> typename std::enable_if<!std::is_base_of<std::exception, E>::value,
                              fbstring>::type
 {
+#ifdef FOLLY_HAS_RTTI
   return folly::to<fbstring>(demangle(typeid(e)));
+#else
+  return "Exception (no RTTI available)";
+#endif
 }
 
 /*
@@ -436,7 +451,9 @@ void splitTo(const Delim& delimiter,
  * Split a string into a fixed number of string pieces and/or numeric types
  * by delimiter. Any numeric type that folly::to<> can convert to from a
  * string piece is supported as a target. Returns 'true' if the fields were
- * all successfully populated.
+ * all successfully populated.  Returns 'false' if there were too few fields
+ * in the input, or too many fields if exact=true.  Casting exceptions will
+ * not be caught.
  *
  * Examples:
  *
@@ -538,7 +555,41 @@ std::string join(const Delim& delimiter, Iterator begin, Iterator end) {
  * Returns a subpiece with all whitespace removed from the front of @sp.
  * Whitespace means any of [' ', '\n', '\r', '\t'].
  */
-StringPiece skipWhitespace(StringPiece sp);
+StringPiece ltrimWhitespace(StringPiece sp);
+
+/**
+ * Returns a subpiece with all whitespace removed from the back of @sp.
+ * Whitespace means any of [' ', '\n', '\r', '\t'].
+ */
+StringPiece rtrimWhitespace(StringPiece sp);
+
+/**
+ * Returns a subpiece with all whitespace removed from the back and front of @sp.
+ * Whitespace means any of [' ', '\n', '\r', '\t'].
+ */
+inline StringPiece trimWhitespace(StringPiece sp) {
+  return ltrimWhitespace(rtrimWhitespace(sp));
+}
+
+/**
+ * Returns a subpiece with all whitespace removed from the front of @sp.
+ * Whitespace means any of [' ', '\n', '\r', '\t'].
+ * DEPRECATED: @see ltrimWhitespace @see rtrimWhitespace
+ */
+inline StringPiece skipWhitespace(StringPiece sp) {
+  return ltrimWhitespace(sp);
+}
+
+/**
+ *  Strips the leading and the trailing whitespace-only lines. Then looks for
+ *  the least indented non-whitespace-only line and removes its amount of
+ *  leading whitespace from every line. Assumes leading whitespace is either all
+ *  spaces or all tabs.
+ *
+ *  Purpose: including a multiline string literal in source code, indented to
+ *  the level expected from context.
+ */
+std::string stripLeftMargin(std::string s);
 
 /**
  * Fast, in-place lowercasing of ASCII alphabetic characters in strings.
@@ -553,6 +604,19 @@ inline void toLowerAscii(MutableStringPiece str) {
   toLowerAscii(str.begin(), str.size());
 }
 
+template <class Iterator = const char*,
+          class Base = folly::Range<boost::u8_to_u32_iterator<Iterator>>>
+class UTF8Range : public Base {
+ public:
+  /* implicit */ UTF8Range(const folly::Range<Iterator> baseRange)
+      : Base(boost::u8_to_u32_iterator<Iterator>(
+                 baseRange.begin(), baseRange.begin(), baseRange.end()),
+             boost::u8_to_u32_iterator<Iterator>(
+                 baseRange.end(), baseRange.begin(), baseRange.end())) {}
+};
+
+using UTF8StringPiece = UTF8Range<const char*>;
+
 } // namespace folly
 
 // Hook into boost's type traits
@@ -564,5 +628,3 @@ struct has_nothrow_constructor<folly::basic_fbstring<T> > : true_type {
 } // namespace boost
 
 #include <folly/String-inl.h>
-
-#endif

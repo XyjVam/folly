@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_DYNAMIC_INL_H_
-#define FOLLY_DYNAMIC_INL_H_
+#pragma once
 
 #include <functional>
 #include <boost/iterator/iterator_adaptor.hpp>
@@ -59,18 +58,10 @@ struct hash< ::folly::dynamic> {
 namespace folly {
 
 struct TypeError : std::runtime_error {
-  explicit TypeError(const std::string& expected, dynamic::Type actual)
-    : std::runtime_error(to<std::string>("TypeError: expected dynamic "
-        "type `", expected, '\'', ", but had type `",
-        dynamic::typeName(actual), '\''))
-  {}
+  explicit TypeError(const std::string& expected, dynamic::Type actual);
   explicit TypeError(const std::string& expected,
-      dynamic::Type actual1, dynamic::Type actual2)
-    : std::runtime_error(to<std::string>("TypeError: expected dynamic "
-        "types `", expected, '\'', ", but had types `",
-        dynamic::typeName(actual1), "' and `", dynamic::typeName(actual2),
-        '\''))
-  {}
+    dynamic::Type actual1, dynamic::Type actual2);
+  ~TypeError();
 };
 
 
@@ -197,9 +188,20 @@ private:
   dynamic val_;
 };
 
+inline void dynamic::array(EmptyArrayTag) {}
+
+template <class... Args>
+inline dynamic dynamic::array(Args&& ...args) {
+  return dynamic(std::initializer_list<dynamic>{std::forward<Args>(args)...},
+                 PrivateTag());
+}
+
 // This looks like a case for perfect forwarding, but our use of
 // std::initializer_list for constructing dynamic arrays makes it less
 // functional than doing this manually.
+
+// TODO(ott, 10300209): When the initializer_list constructor is gone,
+// simplify this.
 inline dynamic::ObjectMaker dynamic::object() { return ObjectMaker(); }
 inline dynamic::ObjectMaker dynamic::object(dynamic&& a, dynamic&& b) {
   return ObjectMaker(std::move(a), std::move(b));
@@ -254,6 +256,12 @@ struct dynamic::const_value_iterator
 
 //////////////////////////////////////////////////////////////////////
 
+inline dynamic::dynamic(void (*)(EmptyArrayTag))
+  : type_(ARRAY)
+{
+  new (&u_.array) Array();
+}
+
 inline dynamic::dynamic(ObjectMaker (*)())
   : type_(OBJECT)
 {
@@ -291,9 +299,18 @@ inline dynamic::dynamic(fbstring&& s)
 }
 
 inline dynamic::dynamic(std::initializer_list<dynamic> il)
+  : dynamic(std::move(il), PrivateTag()) {
+}
+
+inline dynamic::dynamic(std::initializer_list<dynamic> il, PrivateTag)
   : type_(ARRAY)
 {
   new (&u_.array) Array(il.begin(), il.end());
+}
+
+inline dynamic& dynamic::operator=(std::initializer_list<dynamic> il) {
+  (*this) = dynamic(il, PrivateTag());
+  return *this;
 }
 
 inline dynamic::dynamic(ObjectMaker&& maker)
@@ -392,18 +409,23 @@ inline double   dynamic::asDouble() const { return asImpl<double>(); }
 inline int64_t  dynamic::asInt()    const { return asImpl<int64_t>(); }
 inline bool     dynamic::asBool()   const { return asImpl<bool>(); }
 
-inline const fbstring& dynamic::getString() const { return get<fbstring>(); }
-inline double          dynamic::getDouble() const { return get<double>(); }
-inline int64_t         dynamic::getInt()    const { return get<int64_t>(); }
-inline bool            dynamic::getBool()   const { return get<bool>(); }
+inline const fbstring& dynamic::getString() const& { return get<fbstring>(); }
+inline double          dynamic::getDouble() const& { return get<double>(); }
+inline int64_t         dynamic::getInt()    const& { return get<int64_t>(); }
+inline bool            dynamic::getBool()   const& { return get<bool>(); }
 
-inline fbstring& dynamic::getString() { return get<fbstring>(); }
-inline double&   dynamic::getDouble() { return get<double>(); }
-inline int64_t&  dynamic::getInt()    { return get<int64_t>(); }
-inline bool&     dynamic::getBool()   { return get<bool>(); }
+inline fbstring& dynamic::getString() & { return get<fbstring>(); }
+inline double&   dynamic::getDouble() & { return get<double>(); }
+inline int64_t&  dynamic::getInt()    & { return get<int64_t>(); }
+inline bool&     dynamic::getBool()   & { return get<bool>(); }
 
-inline const char* dynamic::data()  const { return get<fbstring>().data();  }
-inline const char* dynamic::c_str() const { return get<fbstring>().c_str(); }
+inline fbstring dynamic::getString() && { return std::move(get<fbstring>()); }
+inline double   dynamic::getDouble() && { return get<double>(); }
+inline int64_t  dynamic::getInt()    && { return get<int64_t>(); }
+inline bool     dynamic::getBool()   && { return get<bool>(); }
+
+inline const char* dynamic::data()  const& { return get<fbstring>().data();  }
+inline const char* dynamic::c_str() const& { return get<fbstring>().c_str(); }
 inline StringPiece dynamic::stringPiece() const { return get<fbstring>(); }
 
 template<class T>
@@ -412,40 +434,11 @@ struct dynamic::CompareOp {
 };
 template<>
 struct dynamic::CompareOp<dynamic::ObjectImpl> {
-  static bool comp(ObjectImpl const& a, ObjectImpl const& b) {
+  static bool comp(ObjectImpl const&, ObjectImpl const&) {
     // This code never executes; it is just here for the compiler.
     return false;
   }
 };
-
-inline bool dynamic::operator<(dynamic const& o) const {
-  if (UNLIKELY(type_ == OBJECT || o.type_ == OBJECT)) {
-    throw TypeError("object", type_);
-  }
-  if (type_ != o.type_) {
-    return type_ < o.type_;
-  }
-
-#define FB_X(T) return CompareOp<T>::comp(*getAddress<T>(),   \
-                                          *o.getAddress<T>())
-  FB_DYNAMIC_APPLY(type_, FB_X);
-#undef FB_X
-}
-
-inline bool dynamic::operator==(dynamic const& o) const {
-  if (type() != o.type()) {
-    if (isNumber() && o.isNumber()) {
-      auto& integ = isInt() ? *this : o;
-      auto& doubl = isInt() ? o     : *this;
-      return integ.asInt() == doubl.asDouble();
-    }
-    return false;
-  }
-
-#define FB_X(T) return *getAddress<T>() == *o.getAddress<T>();
-  FB_DYNAMIC_APPLY(type_, FB_X);
-#undef FB_X
-}
 
 inline dynamic& dynamic::operator+=(dynamic const& o) {
   if (type() == STRING && o.type() == STRING) {
@@ -497,58 +490,12 @@ inline dynamic& dynamic::operator--() {
   return *this;
 }
 
-inline dynamic& dynamic::operator=(dynamic const& o) {
-  if (&o != this) {
-    destroy();
-#define FB_X(T) new (getAddress<T>()) T(*o.getAddress<T>())
-    FB_DYNAMIC_APPLY(o.type_, FB_X);
-#undef FB_X
-    type_ = o.type_;
-  }
-  return *this;
-}
-
-inline dynamic& dynamic::operator=(dynamic&& o) noexcept {
-  if (&o != this) {
-    destroy();
-#define FB_X(T) new (getAddress<T>()) T(std::move(*o.getAddress<T>()))
-    FB_DYNAMIC_APPLY(o.type_, FB_X);
-#undef FB_X
-    type_ = o.type_;
-  }
-  return *this;
-}
-
-inline dynamic& dynamic::operator[](dynamic const& k) {
-  if (!isObject() && !isArray()) {
-    throw TypeError("object/array", type());
-  }
-  if (isArray()) {
-    return at(k);
-  }
-  auto& obj = get<ObjectImpl>();
-  auto ret = obj.insert({k, nullptr});
-  return ret.first->second;
-}
-
-inline dynamic const& dynamic::operator[](dynamic const& idx) const {
+inline dynamic const& dynamic::operator[](dynamic const& idx) const& {
   return at(idx);
 }
 
-inline dynamic dynamic::getDefault(const dynamic& k, const dynamic& v) const {
-  auto& obj = get<ObjectImpl>();
-  auto it = obj.find(k);
-  return it == obj.end() ? v : it->second;
-}
-
-inline dynamic&& dynamic::getDefault(const dynamic& k, dynamic&& v) const {
-  auto& obj = get<ObjectImpl>();
-  auto it = obj.find(k);
-  if (it != obj.end()) {
-    v = it->second;
-  }
-
-  return std::move(v);
+inline dynamic dynamic::operator[](dynamic const& idx) && {
+  return std::move((*this)[idx]);
 }
 
 template<class K, class V> inline dynamic& dynamic::setDefault(K&& k, V&& v) {
@@ -557,53 +504,16 @@ template<class K, class V> inline dynamic& dynamic::setDefault(K&& k, V&& v) {
                                    std::forward<V>(v))).first->second;
 }
 
-inline dynamic* dynamic::get_ptr(dynamic const& idx) {
+inline dynamic* dynamic::get_ptr(dynamic const& idx) & {
   return const_cast<dynamic*>(const_cast<dynamic const*>(this)->get_ptr(idx));
 }
 
-inline const dynamic* dynamic::get_ptr(dynamic const& idx) const {
-  if (auto* parray = get_nothrow<Array>()) {
-    if (!idx.isInt()) {
-      throw TypeError("int64", idx.type());
-    }
-    if (idx >= parray->size()) {
-      return nullptr;
-    }
-    return &(*parray)[idx.asInt()];
-  } else if (auto* pobject = get_nothrow<ObjectImpl>()) {
-    auto it = pobject->find(idx);
-    if (it == pobject->end()) {
-      return nullptr;
-    }
-    return &it->second;
-  } else {
-    throw TypeError("object/array", type());
-  }
-}
-
-inline dynamic& dynamic::at(dynamic const& idx) {
+inline dynamic& dynamic::at(dynamic const& idx) & {
   return const_cast<dynamic&>(const_cast<dynamic const*>(this)->at(idx));
 }
 
-inline dynamic const& dynamic::at(dynamic const& idx) const {
-  if (auto* parray = get_nothrow<Array>()) {
-    if (!idx.isInt()) {
-      throw TypeError("int64", idx.type());
-    }
-    if (idx >= parray->size()) {
-      throw std::out_of_range("out of range in dynamic array");
-    }
-    return (*parray)[idx.asInt()];
-  } else if (auto* pobject = get_nothrow<ObjectImpl>()) {
-    auto it = pobject->find(idx);
-    if (it == pobject->end()) {
-      throw std::out_of_range(to<std::string>(
-          "couldn't find key ", idx.asString(), " in dynamic object"));
-    }
-    return it->second;
-  } else {
-    throw TypeError("object/array", type());
-  }
+inline dynamic dynamic::at(dynamic const& idx) && {
+  return std::move(at(idx));
 }
 
 inline bool dynamic::empty() const {
@@ -611,19 +521,6 @@ inline bool dynamic::empty() const {
     return true;
   }
   return !size();
-}
-
-inline std::size_t dynamic::size() const {
-  if (auto* ar = get_nothrow<Array>()) {
-    return ar->size();
-  }
-  if (auto* obj = get_nothrow<ObjectImpl>()) {
-    return obj->size();
-  }
-  if (auto* str = get_nothrow<fbstring>()) {
-    return str->size();
-  }
-  throw TypeError("array/object", type());
 }
 
 inline std::size_t dynamic::count(dynamic const& key) const {
@@ -640,6 +537,41 @@ template<class K, class V> inline void dynamic::insert(K&& key, V&& val) {
   rv.first->second = std::forward<V>(val);
 }
 
+inline void dynamic::update(const dynamic& mergeObj) {
+  if (!isObject() || !mergeObj.isObject()) {
+    throw TypeError("object", type(), mergeObj.type());
+  }
+
+  for (const auto& pair : mergeObj.items()) {
+    (*this)[pair.first] = pair.second;
+  }
+}
+
+inline void dynamic::update_missing(const dynamic& mergeObj1) {
+  if (!isObject() || !mergeObj1.isObject()) {
+    throw TypeError("object", type(), mergeObj1.type());
+  }
+
+  // Only add if not already there
+  for (const auto& pair : mergeObj1.items()) {
+    if ((*this).find(pair.first) == (*this).items().end()) {
+      (*this)[pair.first] = pair.second;
+    }
+  }
+}
+
+inline dynamic dynamic::merge(
+    const dynamic& mergeObj1,
+    const dynamic& mergeObj2) {
+
+  // No checks on type needed here because they are done in update_missing
+  // Note that we do update_missing here instead of update() because
+  // it will prevent the extra writes that would occur with update()
+  auto ret = mergeObj2;
+  ret.update_missing(mergeObj1);
+  return ret;
+}
+
 inline std::size_t dynamic::erase(dynamic const& key) {
   auto& obj = get<ObjectImpl>();
   return obj.erase(key);
@@ -651,14 +583,6 @@ inline dynamic::const_iterator dynamic::erase(const_iterator it) {
   // even though the standard says it should, so this hack converts to a
   // non-const iterator before calling erase.
   return get<Array>().erase(arr.begin() + (it - arr.begin()));
-}
-
-inline dynamic::const_iterator
-dynamic::erase(const_iterator first, const_iterator last) {
-  auto& arr = get<Array>();
-  return get<Array>().erase(
-    arr.begin() + (first - arr.begin()),
-    arr.begin() + (last - arr.begin()));
 }
 
 inline dynamic::const_key_iterator dynamic::erase(const_key_iterator it) {
@@ -692,64 +616,43 @@ inline dynamic::const_item_iterator dynamic::erase(const_item_iterator first,
 }
 
 inline void dynamic::resize(std::size_t sz, dynamic const& c) {
-  auto& array = get<Array>();
-  array.resize(sz, c);
+  auto& arr = get<Array>();
+  arr.resize(sz, c);
 }
 
 inline void dynamic::push_back(dynamic const& v) {
-  auto& array = get<Array>();
-  array.push_back(v);
+  auto& arr = get<Array>();
+  arr.push_back(v);
 }
 
 inline void dynamic::push_back(dynamic&& v) {
-  auto& array = get<Array>();
-  array.push_back(std::move(v));
+  auto& arr = get<Array>();
+  arr.push_back(std::move(v));
 }
 
 inline void dynamic::pop_back() {
-  auto& array = get<Array>();
-  array.pop_back();
-}
-
-inline std::size_t dynamic::hash() const {
-  switch (type()) {
-  case OBJECT:
-  case ARRAY:
-  case NULLT:
-    throw TypeError("not null/object/array", type());
-  case INT64:
-    return std::hash<int64_t>()(asInt());
-  case DOUBLE:
-    return std::hash<double>()(asDouble());
-  case BOOL:
-    return std::hash<bool>()(asBool());
-  case STRING:
-    return std::hash<fbstring>()(asString());
-  default:
-    CHECK(0); abort();
-  }
+  auto& arr = get<Array>();
+  arr.pop_back();
 }
 
 //////////////////////////////////////////////////////////////////////
 
-template<class T> struct dynamic::TypeInfo {
-  static char const name[];
-  static Type const type;
-};
+#define FOLLY_DYNAMIC_DEC_TYPEINFO(T, str, val) \
+  template <> struct dynamic::TypeInfo<T> { \
+    static constexpr const char* name = str; \
+    static constexpr dynamic::Type type = val; \
+  }; \
+  //
 
-#define FB_DEC_TYPE(T)                                      \
-  template<> char const dynamic::TypeInfo<T>::name[];       \
-  template<> dynamic::Type const dynamic::TypeInfo<T>::type
+FOLLY_DYNAMIC_DEC_TYPEINFO(void*,               "null",    dynamic::NULLT)
+FOLLY_DYNAMIC_DEC_TYPEINFO(bool,                "boolean", dynamic::BOOL)
+FOLLY_DYNAMIC_DEC_TYPEINFO(fbstring,            "string",  dynamic::STRING)
+FOLLY_DYNAMIC_DEC_TYPEINFO(dynamic::Array,      "array",   dynamic::ARRAY)
+FOLLY_DYNAMIC_DEC_TYPEINFO(double,              "double",  dynamic::DOUBLE)
+FOLLY_DYNAMIC_DEC_TYPEINFO(int64_t,             "int64",   dynamic::INT64)
+FOLLY_DYNAMIC_DEC_TYPEINFO(dynamic::ObjectImpl, "object",  dynamic::OBJECT)
 
-FB_DEC_TYPE(void*);
-FB_DEC_TYPE(bool);
-FB_DEC_TYPE(fbstring);
-FB_DEC_TYPE(dynamic::Array);
-FB_DEC_TYPE(double);
-FB_DEC_TYPE(int64_t);
-FB_DEC_TYPE(dynamic::ObjectImpl);
-
-#undef FB_DEC_TYPE
+#undef FOLLY_DYNAMIC_DEC_TYPEINFO
 
 template<class T>
 T dynamic::asImpl() const {
@@ -765,7 +668,7 @@ T dynamic::asImpl() const {
 
 // Return a T* to our type, or null if we're not that type.
 template<class T>
-T* dynamic::get_nothrow() noexcept {
+T* dynamic::get_nothrow() & noexcept {
   if (type_ != TypeInfo<T>::type) {
     return nullptr;
   }
@@ -773,7 +676,7 @@ T* dynamic::get_nothrow() noexcept {
 }
 
 template<class T>
-T const* dynamic::get_nothrow() const noexcept {
+T const* dynamic::get_nothrow() const& noexcept {
   return const_cast<dynamic*>(this)->get_nothrow<T>();
 }
 
@@ -833,23 +736,6 @@ T const& dynamic::get() const {
   return const_cast<dynamic*>(this)->get<T>();
 }
 
-inline char const* dynamic::typeName(Type t) {
-#define FB_X(T) return TypeInfo<T>::name
-  FB_DYNAMIC_APPLY(t, FB_X);
-#undef FB_X
-}
-
-inline void dynamic::destroy() noexcept {
-  // This short-circuit speeds up some microbenchmarks.
-  if (type_ == NULLT) return;
-
-#define FB_X(T) detail::Destroy::destroy(getAddress<T>())
-  FB_DYNAMIC_APPLY(type_, FB_X);
-#undef FB_X
-  type_ = NULLT;
-  u_.nul = nullptr;
-}
-
 //////////////////////////////////////////////////////////////////////
 
 /*
@@ -860,6 +746,16 @@ template<class T>
 struct dynamic::PrintImpl {
   static void print(dynamic const&, std::ostream& out, T const& t) {
     out << t;
+  }
+};
+// Otherwise, null, being (void*)0, would print as 0.
+template <>
+struct dynamic::PrintImpl<void*> {
+  static void print(dynamic const& /* d */,
+                    std::ostream& out,
+                    void* const& nul) {
+    DCHECK_EQ((void*)0, nul);
+    out << "null";
   }
 };
 template<>
@@ -977,5 +873,3 @@ class FormatValue<detail::DefaultValueWrapper<dynamic, V>> {
 }  // namespaces
 
 #undef FB_DYNAMIC_APPLY
-
-#endif

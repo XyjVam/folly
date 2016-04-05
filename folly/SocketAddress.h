@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,12 +27,13 @@
 
 #include <folly/IPAddress.h>
 #include <folly/Portability.h>
+#include <folly/Range.h>
 
 namespace folly {
 
 class SocketAddress {
  public:
-  SocketAddress() {}
+  SocketAddress() = default;
 
   /**
    * Construct a SocketAddress from a hostname and port.
@@ -71,6 +72,10 @@ class SocketAddress {
     } else {
       setFromIpPort(host.c_str(), port);
     }
+  }
+
+  SocketAddress(const IPAddress& ipAddr, uint16_t port) {
+    setFromIpAddrPort(ipAddr, port);
   }
 
   SocketAddress(const SocketAddress& addr) {
@@ -191,6 +196,14 @@ class SocketAddress {
   }
 
   /**
+   * Initialize this SocketAddress from an IPAddress struct and port.
+   *
+   * @param ip The IP address in IPAddress format
+   * @param port The port (in host byte order)
+   */
+  void setFromIpAddrPort(const IPAddress& ip, uint16_t port);
+
+  /**
    * Initialize this SocketAddress from a local port number.
    *
    * This is intended to be used by server code to determine the address to
@@ -266,32 +279,31 @@ class SocketAddress {
    *
    * Raises std::invalid_argument on error.
    */
-  void setFromPath(const char* path) {
-    setFromPath(path, strlen(path));
+  void setFromPath(StringPiece path);
+
+  void setFromPath(const char* path, size_t length) {
+    setFromPath(StringPiece{path, length});
   }
 
-  void setFromPath(const std::string& path) {
-    setFromPath(path.data(), path.length());
-  }
-
-  void setFromPath(const char* path, size_t length);
+  // a typedef that allow us to compile against both winsock & POSIX sockets:
+  using SocketDesc = decltype(socket(0,0,0)); // POSIX: int, winsock: unsigned
 
   /**
    * Initialize this SocketAddress from a socket's peer address.
    *
    * Raises std::system_error on error.
    */
-  void setFromPeerAddress(int socket);
+  void setFromPeerAddress(SocketDesc socket);
 
   /**
    * Initialize this SocketAddress from a socket's local address.
    *
    * Raises std::system_error on error.
    */
-  void setFromLocalAddress(int socket);
+  void setFromLocalAddress(SocketDesc socket);
 
   /**
-   * Initialize this TSocketAddress from a struct sockaddr.
+   * Initialize this folly::SocketAddress from a struct sockaddr.
    *
    * Raises std::system_error on error.
    *
@@ -544,11 +556,19 @@ class SocketAddress {
     }
   };
 
+  // a typedef that allow us to compile against both winsock & POSIX sockets:
+  // (both arg types and calling conventions differ for both)
+  // POSIX: void setFromSocket(int socket,
+  //                  int(*fn)(int, struct sockaddr*, socklen_t*));
+  // mingw: void setFromSocket(unsigned socket,
+  //                  int(*fn)(unsigned, struct sockaddr*, socklen_t*));
+  using GetPeerNameFunc = decltype(getpeername);
+
   struct addrinfo* getAddrInfo(const char* host, uint16_t port, int flags);
   struct addrinfo* getAddrInfo(const char* host, const char* port, int flags);
   void setFromAddrInfo(const struct addrinfo* results);
   void setFromLocalAddr(const struct addrinfo* results);
-  void setFromSocket(int socket, int (*fn)(int, struct sockaddr*, socklen_t*));
+  void setFromSocket(SocketDesc socket, GetPeerNameFunc fn);
   std::string getIpString(int flags) const;
   void getIpString(char *buf, size_t buflen, int flags) const;
 

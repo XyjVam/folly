@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,18 +17,22 @@
 #include <folly/io/async/AsyncSocket.h>
 
 #include <folly/io/async/EventBase.h>
+#include <folly/io/async/EventHandler.h>
 #include <folly/SocketAddress.h>
 #include <folly/io/IOBuf.h>
+#include <folly/portability/SysUio.h>
 
 #include <poll.h>
 #include <errno.h>
 #include <limits.h>
 #include <unistd.h>
+#include <thread>
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <boost/preprocessor/control/if.hpp>
 
 using std::string;
 using std::unique_ptr;
@@ -43,7 +47,7 @@ const AsyncSocketException socketClosedLocallyEx(
 const AsyncSocketException socketShutdownForWritesEx(
     AsyncSocketException::END_OF_FILE, "socket shutdown for writes");
 
-// TODO: It might help performance to provide a version of WriteRequest that
+// TODO: It might help performance to provide a version of BytesWriteRequest that
 // users could derive from, so we can avoid the extra allocation for each call
 // to write()/writev().  We could templatize TFramedAsyncChannel just like the
 // protocols are currently templatized for transports.
@@ -52,57 +56,101 @@ const AsyncSocketException socketShutdownForWritesEx(
 // storage space, and only our internal version would allocate it at the end of
 // the WriteRequest.
 
-/**
- * A WriteRequest object tracks information about a pending write() or writev()
- * operation.
+/* The default WriteRequest implementation, used for write(), writev() and
+ * writeChain()
  *
- * A new WriteRequest operation is allocated on the heap for all write
+ * A new BytesWriteRequest operation is allocated on the heap for all write
  * operations that cannot be completed immediately.
  */
-class AsyncSocket::WriteRequest {
+class AsyncSocket::BytesWriteRequest : public AsyncSocket::WriteRequest {
  public:
-  static WriteRequest* newRequest(WriteCallback* callback,
-                                  const iovec* ops,
-                                  uint32_t opCount,
-                                  unique_ptr<IOBuf>&& ioBuf,
-                                  WriteFlags flags) {
+  static BytesWriteRequest* newRequest(AsyncSocket* socket,
+                                       WriteCallback* callback,
+                                       const iovec* ops,
+                                       uint32_t opCount,
+                                       uint32_t partialWritten,
+                                       uint32_t bytesWritten,
+                                       unique_ptr<IOBuf>&& ioBuf,
+                                       WriteFlags flags) {
     assert(opCount > 0);
     // Since we put a variable size iovec array at the end
-    // of each WriteRequest, we have to manually allocate the memory.
-    void* buf = malloc(sizeof(WriteRequest) +
+    // of each BytesWriteRequest, we have to manually allocate the memory.
+    void* buf = malloc(sizeof(BytesWriteRequest) +
                        (opCount * sizeof(struct iovec)));
     if (buf == nullptr) {
       throw std::bad_alloc();
     }
 
-    return new(buf) WriteRequest(callback, ops, opCount, std::move(ioBuf),
-                                 flags);
+    return new(buf) BytesWriteRequest(socket, callback, ops, opCount,
+                                      partialWritten, bytesWritten,
+                                      std::move(ioBuf), flags);
   }
 
-  void destroy() {
-    this->~WriteRequest();
+  void destroy() override {
+    this->~BytesWriteRequest();
     free(this);
   }
 
-  bool cork() const {
-    return isSet(flags_, WriteFlags::CORK);
+  bool performWrite() override {
+    WriteFlags writeFlags = flags_;
+    if (getNext() != nullptr) {
+      writeFlags = writeFlags | WriteFlags::CORK;
+    }
+    bytesWritten_ = socket_->performWrite(getOps(), getOpCount(), writeFlags,
+                                          &opsWritten_, &partialBytes_);
+    return bytesWritten_ >= 0;
   }
 
-  WriteFlags flags() const {
-    return flags_;
+  bool isComplete() override {
+    return opsWritten_ == getOpCount();
   }
 
-  WriteRequest* getNext() const {
-    return next_;
+  void consume() override {
+    // Advance opIndex_ forward by opsWritten_
+    opIndex_ += opsWritten_;
+    assert(opIndex_ < opCount_);
+
+    // If we've finished writing any IOBufs, release them
+    if (ioBuf_) {
+      for (uint32_t i = opsWritten_; i != 0; --i) {
+        assert(ioBuf_);
+        ioBuf_ = ioBuf_->pop();
+      }
+    }
+
+    // Move partialBytes_ forward into the current iovec buffer
+    struct iovec* currentOp = writeOps_ + opIndex_;
+    assert((partialBytes_ < currentOp->iov_len) || (currentOp->iov_len == 0));
+    currentOp->iov_base =
+      reinterpret_cast<uint8_t*>(currentOp->iov_base) + partialBytes_;
+    currentOp->iov_len -= partialBytes_;
+
+    // Increment the totalBytesWritten_ count by bytesWritten_;
+    totalBytesWritten_ += bytesWritten_;
   }
 
-  WriteCallback* getCallback() const {
-    return callback_;
+ private:
+  BytesWriteRequest(AsyncSocket* socket,
+                    WriteCallback* callback,
+                    const struct iovec* ops,
+                    uint32_t opCount,
+                    uint32_t partialBytes,
+                    uint32_t bytesWritten,
+                    unique_ptr<IOBuf>&& ioBuf,
+                    WriteFlags flags)
+    : AsyncSocket::WriteRequest(socket, callback)
+    , opCount_(opCount)
+    , opIndex_(0)
+    , flags_(flags)
+    , ioBuf_(std::move(ioBuf))
+    , opsWritten_(0)
+    , partialBytes_(partialBytes)
+    , bytesWritten_(bytesWritten) {
+    memcpy(writeOps_, ops, sizeof(*ops) * opCount_);
   }
 
-  uint32_t getBytesWritten() const {
-    return bytesWritten_;
-  }
+  // private destructor, to ensure callers use destroy()
+  ~BytesWriteRequest() override = default;
 
   const struct iovec* getOps() const {
     assert(opCount_ > opIndex_);
@@ -114,69 +162,24 @@ class AsyncSocket::WriteRequest {
     return opCount_ - opIndex_;
   }
 
-  void consume(uint32_t wholeOps, uint32_t partialBytes,
-               uint32_t totalBytesWritten) {
-    // Advance opIndex_ forward by wholeOps
-    opIndex_ += wholeOps;
-    assert(opIndex_ < opCount_);
-
-    // If we've finished writing any IOBufs, release them
-    if (ioBuf_) {
-      for (uint32_t i = wholeOps; i != 0; --i) {
-        assert(ioBuf_);
-        ioBuf_ = ioBuf_->pop();
-      }
-    }
-
-    // Move partialBytes forward into the current iovec buffer
-    struct iovec* currentOp = writeOps_ + opIndex_;
-    assert((partialBytes < currentOp->iov_len) || (currentOp->iov_len == 0));
-    currentOp->iov_base =
-      reinterpret_cast<uint8_t*>(currentOp->iov_base) + partialBytes;
-    currentOp->iov_len -= partialBytes;
-
-    // Increment the bytesWritten_ count by totalBytesWritten
-    bytesWritten_ += totalBytesWritten;
-  }
-
-  void append(WriteRequest* next) {
-    assert(next_ == nullptr);
-    next_ = next;
-  }
-
- private:
-  WriteRequest(WriteCallback* callback,
-               const struct iovec* ops,
-               uint32_t opCount,
-               unique_ptr<IOBuf>&& ioBuf,
-               WriteFlags flags)
-    : next_(nullptr)
-    , callback_(callback)
-    , bytesWritten_(0)
-    , opCount_(opCount)
-    , opIndex_(0)
-    , flags_(flags)
-    , ioBuf_(std::move(ioBuf)) {
-    memcpy(writeOps_, ops, sizeof(*ops) * opCount_);
-  }
-
-  // Private destructor, to ensure callers use destroy()
-  ~WriteRequest() {}
-
-  WriteRequest* next_;          ///< pointer to next WriteRequest
-  WriteCallback* callback_;     ///< completion callback
-  uint32_t bytesWritten_;       ///< bytes written
   uint32_t opCount_;            ///< number of entries in writeOps_
   uint32_t opIndex_;            ///< current index into writeOps_
   WriteFlags flags_;            ///< set for WriteFlags
   unique_ptr<IOBuf> ioBuf_;     ///< underlying IOBuf, or nullptr if N/A
+
+  // for consume(), how much we wrote on the last write
+  uint32_t opsWritten_;         ///< complete ops written
+  uint32_t partialBytes_;       ///< partial bytes of incomplete op written
+  ssize_t bytesWritten_;        ///< bytes written altogether
+
   struct iovec writeOps_[];     ///< write operation(s) list
 };
 
 AsyncSocket::AsyncSocket()
   : eventBase_(nullptr)
   , writeTimeout_(this, nullptr)
-  , ioHandler_(this, nullptr) {
+  , ioHandler_(this, nullptr)
+  , immediateReadHandler_(this) {
   VLOG(5) << "new AsyncSocket()";
   init();
 }
@@ -184,7 +187,8 @@ AsyncSocket::AsyncSocket()
 AsyncSocket::AsyncSocket(EventBase* evb)
   : eventBase_(evb)
   , writeTimeout_(this, evb)
-  , ioHandler_(this, evb) {
+  , ioHandler_(this, evb)
+  , immediateReadHandler_(this) {
   VLOG(5) << "new AsyncSocket(" << this << ", evb=" << evb << ")";
   init();
 }
@@ -207,7 +211,8 @@ AsyncSocket::AsyncSocket(EventBase* evb,
 AsyncSocket::AsyncSocket(EventBase* evb, int fd)
   : eventBase_(evb)
   , writeTimeout_(this, evb)
-  , ioHandler_(this, evb, fd) {
+  , ioHandler_(this, evb, fd)
+  , immediateReadHandler_(this) {
   VLOG(5) << "new AsyncSocket(" << this << ", evb=" << evb << ", fd="
           << fd << ")";
   init();
@@ -293,9 +298,11 @@ void AsyncSocket::setShutdownSocketSet(ShutdownSocketSet* newSS) {
 void AsyncSocket::setCloseOnExec() {
   int rv = fcntl(fd_, F_SETFD, FD_CLOEXEC);
   if (rv != 0) {
-    throw AsyncSocketException(AsyncSocketException::INTERNAL_ERROR,
-                               withAddr("failed to set close-on-exec flag"),
-                               errno);
+    auto errnoCopy = errno;
+    throw AsyncSocketException(
+        AsyncSocketException::INTERNAL_ERROR,
+        withAddr("failed to set close-on-exec flag"),
+        errnoCopy);
   }
 }
 
@@ -314,6 +321,10 @@ void AsyncSocket::connect(ConnectCallback* callback,
     return invalidState(callback);
   }
 
+  connectStartTime_ = std::chrono::steady_clock::now();
+  // Make connect end time at least >= connectStartTime.
+  connectEndTime_ = connectStartTime_;
+
   assert(fd_ == -1);
   state_ = StateEnum::CONNECTING;
   connectCallback_ = callback;
@@ -329,8 +340,11 @@ void AsyncSocket::connect(ConnectCallback* callback,
     // implementations the PF_foo and AF_foo constants are identical.
     fd_ = socket(address.getFamily(), SOCK_STREAM, 0);
     if (fd_ < 0) {
-      throw AsyncSocketException(AsyncSocketException::INTERNAL_ERROR,
-                                withAddr("failed to create socket"), errno);
+      auto errnoCopy = errno;
+      throw AsyncSocketException(
+          AsyncSocketException::INTERNAL_ERROR,
+          withAddr("failed to create socket"),
+          errnoCopy);
     }
     if (shutdownSocketSet_) {
       shutdownSocketSet_->add(fd_);
@@ -342,25 +356,30 @@ void AsyncSocket::connect(ConnectCallback* callback,
     // Put the socket in non-blocking mode
     int flags = fcntl(fd_, F_GETFL, 0);
     if (flags == -1) {
-      throw AsyncSocketException(AsyncSocketException::INTERNAL_ERROR,
-                                withAddr("failed to get socket flags"), errno);
+      auto errnoCopy = errno;
+      throw AsyncSocketException(
+          AsyncSocketException::INTERNAL_ERROR,
+          withAddr("failed to get socket flags"),
+          errnoCopy);
     }
     int rv = fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
     if (rv == -1) {
+      auto errnoCopy = errno;
       throw AsyncSocketException(
           AsyncSocketException::INTERNAL_ERROR,
           withAddr("failed to put socket in non-blocking mode"),
-          errno);
+          errnoCopy);
     }
 
 #if !defined(MSG_NOSIGNAL) && defined(F_SETNOSIGPIPE)
     // iOS and OS X don't support MSG_NOSIGNAL; set F_SETNOSIGPIPE instead
     rv = fcntl(fd_, F_SETNOSIGPIPE, 1);
     if (rv == -1) {
+      auto errnoCopy = errno;
       throw AsyncSocketException(
           AsyncSocketException::INTERNAL_ERROR,
           "failed to enable F_SETNOSIGPIPE on socket",
-          errno);
+          errnoCopy);
     }
 #endif
 
@@ -378,21 +397,23 @@ void AsyncSocket::connect(ConnectCallback* callback,
     if (bindAddr != anyAddress()) {
       int one = 1;
       if (::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))) {
+        auto errnoCopy = errno;
         doClose();
         throw AsyncSocketException(
-          AsyncSocketException::NOT_OPEN,
-          "failed to setsockopt prior to bind on " + bindAddr.describe(),
-          errno);
+            AsyncSocketException::NOT_OPEN,
+            "failed to setsockopt prior to bind on " + bindAddr.describe(),
+            errnoCopy);
       }
 
       bindAddr.getAddress(&addrStorage);
 
       if (::bind(fd_, saddr, bindAddr.getActualSize()) != 0) {
+        auto errnoCopy = errno;
         doClose();
-        throw AsyncSocketException(AsyncSocketException::NOT_OPEN,
-                                  "failed to bind to async socket: " +
-                                  bindAddr.describe(),
-                                  errno);
+        throw AsyncSocketException(
+            AsyncSocketException::NOT_OPEN,
+            "failed to bind to async socket: " + bindAddr.describe(),
+            errnoCopy);
       }
     }
 
@@ -400,9 +421,11 @@ void AsyncSocket::connect(ConnectCallback* callback,
     for (const auto& opt: options) {
       int rv = opt.first.apply(fd_, opt.second);
       if (rv != 0) {
-        throw AsyncSocketException(AsyncSocketException::INTERNAL_ERROR,
-                                  withAddr("failed to set socket option"),
-                                  errno);
+        auto errnoCopy = errno;
+        throw AsyncSocketException(
+            AsyncSocketException::INTERNAL_ERROR,
+            withAddr("failed to set socket option"),
+            errnoCopy);
       }
     }
 
@@ -411,7 +434,8 @@ void AsyncSocket::connect(ConnectCallback* callback,
 
     rv = ::connect(fd_, saddr, address.getActualSize());
     if (rv < 0) {
-      if (errno == EINPROGRESS) {
+      auto errnoCopy = errno;
+      if (errnoCopy == EINPROGRESS) {
         // Connection in progress.
         if (timeout > 0) {
           // Start a timer in case the connection takes too long.
@@ -432,8 +456,10 @@ void AsyncSocket::connect(ConnectCallback* callback,
         }
         return;
       } else {
-        throw AsyncSocketException(AsyncSocketException::NOT_OPEN,
-                                  "connect failed (immediately)", errno);
+        throw AsyncSocketException(
+            AsyncSocketException::NOT_OPEN,
+            "connect failed (immediately)",
+            errnoCopy);
       }
     }
 
@@ -459,10 +485,7 @@ void AsyncSocket::connect(ConnectCallback* callback,
   assert(readCallback_ == nullptr);
   assert(writeReqHead_ == nullptr);
   state_ = StateEnum::ESTABLISHED;
-  if (callback) {
-    connectCallback_ = nullptr;
-    callback->connectSuccess();
-  }
+  invokeConnectSuccess();
 }
 
 void AsyncSocket::connect(ConnectCallback* callback,
@@ -522,6 +545,12 @@ void AsyncSocket::setReadCB(ReadCallback *callback) {
   // eventBase_->isInEventBaseThread() when eventBase_ is nullptr.
   if (callback == readCallback_) {
     return;
+  }
+
+  /* We are removing a read callback */
+  if (callback == nullptr &&
+      immediateReadHandler_.isLoopCallbackScheduled()) {
+    immediateReadHandler_.cancelLoopCallback();
   }
 
   if (shutdownFlags_ & SHUT_READ) {
@@ -601,21 +630,22 @@ void AsyncSocket::write(WriteCallback* callback,
   iovec op;
   op.iov_base = const_cast<void*>(buf);
   op.iov_len = bytes;
-  writeImpl(callback, &op, 1, std::move(unique_ptr<IOBuf>()), flags);
+  writeImpl(callback, &op, 1, unique_ptr<IOBuf>(), flags);
 }
 
 void AsyncSocket::writev(WriteCallback* callback,
                           const iovec* vec,
                           size_t count,
                           WriteFlags flags) {
-  writeImpl(callback, vec, count, std::move(unique_ptr<IOBuf>()), flags);
+  writeImpl(callback, vec, count, unique_ptr<IOBuf>(), flags);
 }
 
 void AsyncSocket::writeChain(WriteCallback* callback, unique_ptr<IOBuf>&& buf,
                               WriteFlags flags) {
+  constexpr size_t kSmallSizeMax = 64;
   size_t count = buf->countChainElements();
-  if (count <= 64) {
-    iovec vec[count];
+  if (count <= kSmallSizeMax) {
+    iovec vec[BOOST_PP_IF(FOLLY_HAVE_VLA, count, kSmallSizeMax)];
     writeChainImpl(callback, vec, count, std::move(buf), flags);
   } else {
     iovec* vec = new iovec[count];
@@ -666,8 +696,11 @@ void AsyncSocket::writeImpl(WriteCallback* callback, const iovec* vec,
       bytesWritten = performWrite(vec, count, flags,
                                   &countWritten, &partialWritten);
       if (bytesWritten < 0) {
-        AsyncSocketException ex(AsyncSocketException::INTERNAL_ERROR,
-                               withAddr("writev failed"), errno);
+        auto errnoCopy = errno;
+        AsyncSocketException ex(
+            AsyncSocketException::INTERNAL_ERROR,
+            withAddr("writev failed"),
+            errnoCopy);
         return failWrite(__func__, callback, 0, ex);
       } else if (countWritten == count) {
         // We successfully wrote everything.
@@ -676,7 +709,11 @@ void AsyncSocket::writeImpl(WriteCallback* callback, const iovec* vec,
           callback->writeSuccess();
         }
         return;
-      } // else { continue writing the next writeReq }
+      } else { // continue writing the next writeReq
+        if (bufferCallback_) {
+          bufferCallback_->onEgressBuffered();
+        }
+      }
       mustRegister = true;
     }
   } else if (!connecting()) {
@@ -687,16 +724,16 @@ void AsyncSocket::writeImpl(WriteCallback* callback, const iovec* vec,
   // Create a new WriteRequest to add to the queue
   WriteRequest* req;
   try {
-    req = WriteRequest::newRequest(callback, vec + countWritten,
-                                   count - countWritten, std::move(ioBuf),
-                                   flags);
+    req = BytesWriteRequest::newRequest(this, callback, vec + countWritten,
+                                        count - countWritten, partialWritten,
+                                        bytesWritten, std::move(ioBuf), flags);
   } catch (const std::exception& ex) {
     // we mainly expect to catch std::bad_alloc here
     AsyncSocketException tex(AsyncSocketException::INTERNAL_ERROR,
         withAddr(string("failed to append new WriteRequest: ") + ex.what()));
     return failWrite(__func__, callback, bytesWritten, tex);
   }
-  req->consume(0, partialWritten, bytesWritten);
+  req->consume();
   if (writeReqTail_ == nullptr) {
     assert(writeReqHead_ == nullptr);
     writeReqHead_ = writeReqTail_ = req;
@@ -722,6 +759,17 @@ void AsyncSocket::writeImpl(WriteCallback* callback, const iovec* vec,
         return failWrite(__func__, ex);
       }
     }
+  }
+}
+
+void AsyncSocket::writeRequest(WriteRequest* req) {
+  if (writeReqTail_ == nullptr) {
+    assert(writeReqHead_ == nullptr);
+    writeReqHead_ = writeReqTail_ = req;
+    req->start();
+  } else {
+    writeReqTail_->append(req);
+    writeReqTail_ = req;
   }
 }
 
@@ -807,16 +855,16 @@ void AsyncSocket::closeNow() {
         }
       }
 
+      if (immediateReadHandler_.isLoopCallbackScheduled()) {
+        immediateReadHandler_.cancelLoopCallback();
+      }
+
       if (fd_ >= 0) {
         ioHandler_.changeHandlerFD(-1);
         doClose();
       }
 
-      if (connectCallback_) {
-        ConnectCallback* callback = connectCallback_;
-        connectCallback_ = nullptr;
-        callback->connectErr(socketClosedLocallyEx);
-      }
+      invokeConnectErr(socketClosedLocallyEx);
 
       failAllWrites(socketClosedLocallyEx);
 
@@ -1039,7 +1087,10 @@ bool AsyncSocket::isDetachable() const {
 }
 
 void AsyncSocket::getLocalAddress(folly::SocketAddress* address) const {
-  address->setFromLocalAddress(fd_);
+  if (!localAddr_.isInitialized()) {
+    localAddr_.setFromLocalAddress(fd_);
+  }
+  *address = localAddr_;
 }
 
 void AsyncSocket::getPeerAddress(folly::SocketAddress* address) const {
@@ -1207,8 +1258,18 @@ void AsyncSocket::ioReady(uint16_t events) noexcept {
   }
 }
 
-ssize_t AsyncSocket::performRead(void* buf, size_t buflen) {
-  ssize_t bytes = recv(fd_, buf, buflen, MSG_DONTWAIT);
+ssize_t AsyncSocket::performRead(void** buf,
+                                 size_t* buflen,
+                                 size_t* /* offset */) {
+  VLOG(5) << "AsyncSocket::performRead() this=" << this
+          << ", buf=" << *buf << ", buflen=" << *buflen;
+
+  int recvFlags = 0;
+  if (peek_) {
+    recvFlags |= MSG_PEEK;
+  }
+
+  ssize_t bytes = recv(fd_, *buf, *buflen, MSG_DONTWAIT | recvFlags);
   if (bytes < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       // No more data to read right now.
@@ -1220,6 +1281,12 @@ ssize_t AsyncSocket::performRead(void* buf, size_t buflen) {
     appBytesReceived_ += bytes;
     return bytes;
   }
+}
+
+void AsyncSocket::prepareReadBuffer(void** buf, size_t* buflen) noexcept {
+  // no matter what, buffer should be preapared for non-ssl socket
+  CHECK(readCallback_);
+  readCallback_->getReadBuffer(buf, buflen);
 }
 
 void AsyncSocket::handleRead() noexcept {
@@ -1253,9 +1320,10 @@ void AsyncSocket::handleRead() noexcept {
   while (readCallback_ && eventBase_ == originalEventBase) {
     // Get the buffer to read into.
     void* buf = nullptr;
-    size_t buflen = 0;
+    size_t buflen = 0, offset = 0;
     try {
-      readCallback_->getReadBuffer(&buf, &buflen);
+      prepareReadBuffer(&buf, &buflen);
+      VLOG(5) << "prepareReadBuffer() buf=" << buf << ", buflen=" << buflen;
     } catch (const AsyncSocketException& ex) {
       return failRead(__func__, ex);
     } catch (const std::exception& ex) {
@@ -1270,7 +1338,7 @@ void AsyncSocket::handleRead() noexcept {
                              "non-exception type");
       return failRead(__func__, ex);
     }
-    if (buf == nullptr || buflen == 0) {
+    if (!isBufferMovable_ && (buf == nullptr || buflen == 0)) {
       AsyncSocketException ex(AsyncSocketException::BAD_ARGS,
                              "ReadCallback::getReadBuffer() returned "
                              "empty buffer");
@@ -1278,9 +1346,23 @@ void AsyncSocket::handleRead() noexcept {
     }
 
     // Perform the read
-    ssize_t bytesRead = performRead(buf, buflen);
+    ssize_t bytesRead = performRead(&buf, &buflen, &offset);
+    VLOG(4) << "this=" << this << ", AsyncSocket::handleRead() got "
+            << bytesRead << " bytes";
     if (bytesRead > 0) {
-      readCallback_->readDataAvailable(bytesRead);
+      if (!isBufferMovable_) {
+        readCallback_->readDataAvailable(bytesRead);
+      } else {
+        CHECK(kOpenSslModeMoveBufferOwnership);
+        VLOG(5) << "this=" << this << ", AsyncSocket::handleRead() got "
+                << "buf=" << buf << ", " << bytesRead << "/" << buflen
+                << ", offset=" << offset;
+        auto readBuf = folly::IOBuf::takeOwnership(buf, buflen);
+        readBuf->trimStart(offset);
+        readBuf->trimEnd(buflen - offset - bytesRead);
+        readCallback_->readBufferAvailable(std::move(readBuf));
+      }
+
       // Fall through and continue around the loop if the read
       // completely filled the available buffer.
       // Note that readCallback_ may have been uninstalled or changed inside
@@ -1292,11 +1374,16 @@ void AsyncSocket::handleRead() noexcept {
         // No more data to read right now.
         return;
     } else if (bytesRead == READ_ERROR) {
-      AsyncSocketException ex(AsyncSocketException::INTERNAL_ERROR,
-                             withAddr("recv() failed"), errno);
+      readErr_ = READ_ERROR;
+      auto errnoCopy = errno;
+      AsyncSocketException ex(
+          AsyncSocketException::INTERNAL_ERROR,
+          withAddr("recv() failed"),
+          errnoCopy);
       return failRead(__func__, ex);
     } else {
       assert(bytesRead == READ_EOF);
+      readErr_ = READ_EOF;
       // EOF
       shutdownFlags_ |= SHUT_READ;
       if (!updateEventRegistration(0, EventHandler::READ)) {
@@ -1312,6 +1399,11 @@ void AsyncSocket::handleRead() noexcept {
       return;
     }
     if (maxReadsPerEvent_ && (++numReads >= maxReadsPerEvent_)) {
+      if (readCallback_ != nullptr) {
+        // We might still have data in the socket.
+        // (e.g. see comment in AsyncSSLSocket::checkForImmediateRead)
+        scheduleImmediateRead();
+      }
       return;
     }
   }
@@ -1346,20 +1438,14 @@ void AsyncSocket::handleWrite() noexcept {
   // (See the comment in handleRead() explaining how this can happen.)
   EventBase* originalEventBase = eventBase_;
   while (writeReqHead_ != nullptr && eventBase_ == originalEventBase) {
-    uint32_t countWritten;
-    uint32_t partialWritten;
-    WriteFlags writeFlags = writeReqHead_->flags();
-    if (writeReqHead_->getNext() != nullptr) {
-      writeFlags = writeFlags | WriteFlags::CORK;
-    }
-    int bytesWritten = performWrite(writeReqHead_->getOps(),
-                                    writeReqHead_->getOpCount(),
-                                    writeFlags, &countWritten, &partialWritten);
-    if (bytesWritten < 0) {
-      AsyncSocketException ex(AsyncSocketException::INTERNAL_ERROR,
-                             withAddr("writev() failed"), errno);
+    if (!writeReqHead_->performWrite()) {
+      auto errnoCopy = errno;
+      AsyncSocketException ex(
+          AsyncSocketException::INTERNAL_ERROR,
+          withAddr("writev() failed"),
+          errnoCopy);
       return failWrite(__func__, ex);
-    } else if (countWritten == writeReqHead_->getOpCount()) {
+    } else if (writeReqHead_->isComplete()) {
       // We finished this request
       WriteRequest* req = writeReqHead_;
       writeReqHead_ = req->getNext();
@@ -1424,7 +1510,10 @@ void AsyncSocket::handleWrite() noexcept {
       // We'll continue around the loop, trying to write another request
     } else {
       // Partial write.
-      writeReqHead_->consume(countWritten, partialWritten, bytesWritten);
+      if (bufferCallback_) {
+        bufferCallback_->onEgressBuffered();
+      }
+      writeReqHead_->consume();
       // Stop after a partial write; it's highly likely that a subsequent write
       // attempt will just return EAGAIN.
       //
@@ -1446,6 +1535,9 @@ void AsyncSocket::handleWrite() noexcept {
       }
       return;
     }
+  }
+  if (!writeReqHead_ && bufferCallback_) {
+    bufferCallback_->onEgressBufferCleared();
   }
 }
 
@@ -1525,9 +1617,11 @@ void AsyncSocket::handleConnect() noexcept {
   socklen_t len = sizeof(error);
   int rv = getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &len);
   if (rv != 0) {
-    AsyncSocketException ex(AsyncSocketException::INTERNAL_ERROR,
-                           withAddr("error calling getsockopt() after connect"),
-                           errno);
+    auto errnoCopy = errno;
+    AsyncSocketException ex(
+        AsyncSocketException::INTERNAL_ERROR,
+        withAddr("error calling getsockopt() after connect"),
+        errnoCopy);
     VLOG(4) << "AsyncSocket::handleConnect(this=" << this << ", fd="
                << fd_ << " host=" << addr_.describe()
                << ") exception:" << ex.what();
@@ -1564,13 +1658,7 @@ void AsyncSocket::handleConnect() noexcept {
   // callbacks (since the callbacks may call detachEventBase()).
   EventBase* originalEventBase = eventBase_;
 
-  // Call the connect callback.
-  if (connectCallback_) {
-    ConnectCallback* callback = connectCallback_;
-    connectCallback_ = nullptr;
-    callback->connectSuccess();
-  }
-
+  invokeConnectSuccess();
   // Note that the connect callback may have changed our state.
   // (set or unset the read callback, called write(), closed the socket, etc.)
   // The following code needs to handle these situations correctly.
@@ -1621,11 +1709,7 @@ ssize_t AsyncSocket::performWrite(const iovec* vec,
   msg.msg_name = nullptr;
   msg.msg_namelen = 0;
   msg.msg_iov = const_cast<iovec *>(vec);
-#ifdef IOV_MAX // not defined on Android
-  msg.msg_iovlen = std::min(count, (uint32_t)IOV_MAX);
-#else
-  msg.msg_iovlen = std::min(count, (uint32_t)UIO_MAXIOV);
-#endif
+  msg.msg_iovlen = std::min<size_t>(count, kIovMax);
   msg.msg_control = nullptr;
   msg.msg_controllen = 0;
   msg.msg_flags = 0;
@@ -1752,12 +1836,7 @@ void AsyncSocket::finishFail() {
 
   AsyncSocketException ex(AsyncSocketException::INTERNAL_ERROR,
                          withAddr("socket closing after error"));
-  if (connectCallback_) {
-    ConnectCallback* callback = connectCallback_;
-    connectCallback_ = nullptr;
-    callback->connectErr(ex);
-  }
-
+  invokeConnectErr(ex);
   failAllWrites(ex);
 
   if (readCallback_) {
@@ -1783,12 +1862,7 @@ void AsyncSocket::failConnect(const char* fn, const AsyncSocketException& ex) {
                << ex.what();
   startFail();
 
-  if (connectCallback_ != nullptr) {
-    ConnectCallback* callback = connectCallback_;
-    connectCallback_ = nullptr;
-    callback->connectErr(ex);
-  }
-
+  invokeConnectErr(ex);
   finishFail();
 }
 
@@ -1822,7 +1896,7 @@ void AsyncSocket::failWrite(const char* fn, const AsyncSocketException& ex) {
     WriteRequest* req = writeReqHead_;
     writeReqHead_ = req->getNext();
     WriteCallback* callback = req->getCallback();
-    uint32_t bytesWritten = req->getBytesWritten();
+    uint32_t bytesWritten = req->getTotalBytesWritten();
     req->destroy();
     if (callback) {
       callback->writeErr(bytesWritten, ex);
@@ -1859,7 +1933,7 @@ void AsyncSocket::failAllWrites(const AsyncSocketException& ex) {
     writeReqHead_ = req->getNext();
     WriteCallback* callback = req->getCallback();
     if (callback) {
-      callback->writeErr(req->getBytesWritten(), ex);
+      callback->writeErr(req->getTotalBytesWritten(), ex);
     }
     req->destroy();
   }
@@ -1878,6 +1952,7 @@ void AsyncSocket::invalidState(ConnectCallback* callback) {
 
   AsyncSocketException ex(AsyncSocketException::ALREADY_OPEN,
                          "connect() called with socket in invalid state");
+  connectEndTime_ = std::chrono::steady_clock::now();
   if (state_ == StateEnum::CLOSED || state_ == StateEnum::ERROR) {
     if (callback) {
       callback->connectErr(ex);
@@ -1891,6 +1966,24 @@ void AsyncSocket::invalidState(ConnectCallback* callback) {
       callback->connectErr(ex);
     }
     finishFail();
+  }
+}
+
+void AsyncSocket::invokeConnectErr(const AsyncSocketException& ex) {
+  connectEndTime_ = std::chrono::steady_clock::now();
+  if (connectCallback_) {
+    ConnectCallback* callback = connectCallback_;
+    connectCallback_ = nullptr;
+    callback->connectErr(ex);
+  }
+}
+
+void AsyncSocket::invokeConnectSuccess() {
+  connectEndTime_ = std::chrono::steady_clock::now();
+  if (connectCallback_) {
+    ConnectCallback* callback = connectCallback_;
+    connectCallback_ = nullptr;
+    callback->connectSuccess();
   }
 }
 
@@ -1963,6 +2056,10 @@ std::string AsyncSocket::withAddr(const std::string& s) {
     // ignore
   }
   return s + " (peer=" + peer.describe() + ", local=" + local.describe() + ")";
+}
+
+void AsyncSocket::setBufferCallback(BufferCallback* cb) {
+  bufferCallback_ = cb;
 }
 
 } // folly

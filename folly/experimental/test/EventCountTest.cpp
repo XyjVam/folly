@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ void randomPartition(Random& random, T key, int n,
     int m = std::min(n, 1000);
     std::uniform_int_distribution<uint32_t> u(1, m);
     int cut = u(random);
-    out.push_back(std::make_pair(key, cut));
+    out.emplace_back(key, cut);
     n -= cut;
   }
 }

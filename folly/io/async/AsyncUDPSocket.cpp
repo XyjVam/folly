@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -63,16 +63,18 @@ void AsyncUDPSocket::bind(const folly::SocketAddress& address) {
                               errno);
   }
 
-  // put the socket in reuse mode
-  int value = 1;
-  if (setsockopt(socket,
-                 SOL_SOCKET,
-                 SO_REUSEADDR,
-                 &value,
-                 sizeof(value)) != 0) {
-    throw AsyncSocketException(AsyncSocketException::NOT_OPEN,
-                              "failed to put socket in reuse mode",
-                              errno);
+  if (reuseAddr_) {
+    // put the socket in reuse mode
+    int value = 1;
+    if (setsockopt(socket,
+                  SOL_SOCKET,
+                  SO_REUSEADDR,
+                  &value,
+                  sizeof(value)) != 0) {
+      throw AsyncSocketException(AsyncSocketException::NOT_OPEN,
+                                "failed to put socket in reuse mode",
+                                errno);
+    }
   }
 
   if (reusePort_) {
@@ -88,6 +90,18 @@ void AsyncUDPSocket::bind(const folly::SocketAddress& address) {
                                 "failed to put socket in reuse_port mode",
                                 errno);
 
+    }
+  }
+
+  // If we're using IPv6, make sure we don't accept V4-mapped connections
+  if (address.getFamily() == AF_INET6) {
+    int flag = 1;
+    if (::setsockopt(socket, IPPROTO_IPV6, IPV6_V6ONLY,
+                     &flag, sizeof(flag))) {
+      throw AsyncSocketException(
+        AsyncSocketException::NOT_OPEN,
+        "Failed to set IPV6_V6ONLY",
+        errno);
     }
   }
 
@@ -129,8 +143,6 @@ void AsyncUDPSocket::setFD(int fd, FDOwnership ownership) {
 
 ssize_t AsyncUDPSocket::write(const folly::SocketAddress& address,
                                const std::unique_ptr<folly::IOBuf>& buf) {
-  CHECK_NE(-1, fd_) << "Socket not yet bound";
-
   // UDP's typical MTU size is 1500, so high number of buffers
   //   really do not make sense. Optimze for buffer chains with
   //   buffers less than 16, which is the highest I can think of
@@ -144,13 +156,20 @@ ssize_t AsyncUDPSocket::write(const folly::SocketAddress& address,
     iovec_len = 1;
   }
 
+  return writev(address, vec, iovec_len);
+}
+
+ssize_t AsyncUDPSocket::writev(const folly::SocketAddress& address,
+                               const struct iovec* vec, size_t iovec_len) {
+  CHECK_NE(-1, fd_) << "Socket not yet bound";
+
   sockaddr_storage addrStorage;
   address.getAddress(&addrStorage);
 
   struct msghdr msg;
   msg.msg_name = reinterpret_cast<void*>(&addrStorage);
   msg.msg_namelen = address.getActualSize();
-  msg.msg_iov = vec;
+  msg.msg_iov = const_cast<struct iovec*>(vec);
   msg.msg_iovlen = iovec_len;
   msg.msg_control = nullptr;
   msg.msg_controllen = 0;

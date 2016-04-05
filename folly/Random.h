@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,16 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_RANDOM_H_
+#pragma once
 #define FOLLY_RANDOM_H_
 
 #include <type_traits>
 #include <random>
 #include <stdint.h>
-#include <folly/ThreadLocal.h>
+#include <folly/Portability.h>
 
-#if __GNUC_PREREQ(4, 8) && !defined(ANDROID)
+#if FOLLY_HAVE_EXTRANDOM_SFMT19937
 #include <ext/random>
-#define FOLLY_USE_SIMD_PRNG 1
 #endif
 
 namespace folly {
@@ -84,7 +83,7 @@ class Random {
 
  public:
   // Default generator type.
-#if FOLLY_USE_SIMD_PRNG
+#if FOLLY_HAVE_EXTRANDOM_SFMT19937
   typedef __gnu_cxx::sfmt19937 DefaultGenerator;
 #else
   typedef std::mt19937 DefaultGenerator;
@@ -246,5 +245,3 @@ inline uint32_t randomNumberSeed() {
 }
 
 #include <folly/Random-inl.h>
-
-#endif

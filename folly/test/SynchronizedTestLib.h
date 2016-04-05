@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_TEST_SYNCHRONIZEDTESTLIB_H
-#define FOLLY_TEST_SYNCHRONIZEDTESTLIB_H
+#pragma once
 
 // We have mutex types outside of folly that we want to test with Synchronized.
 // Make it easy for mutex implementators to test their classes with
@@ -44,6 +43,6 @@ template <class Mutex> void testTimedSynchronizedWithConst();
 
 template <class Mutex> void testConstCopy();
 
-#include <folly/test/SynchronizedTestLib-inl.h>
+template <class Mutex> void testInPlaceConstruction();
 
-#endif /* FOLLY_TEST_SYNCHRONIZEDTESTLIB_H */
+#include <folly/test/SynchronizedTestLib-inl.h>

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
-#include <folly/Benchmark.h>
 #include <folly/Traits.h>
 
-#include <gflags/gflags.h>
+#include <cstring>
+#include <string>
+#include <utility>
+
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
 using namespace folly;
@@ -110,19 +113,47 @@ TEST(Traits, relational) {
   EXPECT_FALSE((folly::greater_than<uint8_t, 255u, uint8_t>(254u)));
 }
 
-struct CompleteType {};
-struct IncompleteType;
-TEST(Traits, is_complete) {
-  EXPECT_TRUE((folly::is_complete<int>::value));
-  EXPECT_TRUE((folly::is_complete<CompleteType>::value));
-  EXPECT_FALSE((folly::is_complete<IncompleteType>::value));
+template <typename T, typename... Args>
+void testIsRelocatable(Args&&... args) {
+  if (!IsRelocatable<T>::value) return;
+
+  // We use placement new on zeroed memory to avoid garbage subsections
+  char vsrc[sizeof(T)] = { 0 };
+  char vdst[sizeof(T)] = { 0 };
+  char vcpy[sizeof(T)];
+
+  T* src = new (vsrc) T(std::forward<Args>(args)...);
+  SCOPE_EXIT { src->~T(); };
+  std::memcpy(vcpy, vsrc, sizeof(T));
+  T deep(*src);
+  T* dst = new (vdst) T(std::move(*src));
+  SCOPE_EXIT { dst->~T(); };
+
+  EXPECT_EQ(deep, *dst);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+  EXPECT_EQ(deep, *reinterpret_cast<T*>(vcpy));
+#pragma GCC diagnostic pop
+
+  // This test could technically fail; however, this is what relocation
+  // almost always means, so it's a good test to have
+  EXPECT_EQ(std::memcmp(vcpy, vdst, sizeof(T)), 0);
 }
 
-int main(int argc, char ** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
-  if (FLAGS_benchmark) {
-    folly::runBenchmarks();
-  }
-  return RUN_ALL_TESTS();
+TEST(Traits, actuallyRelocatable) {
+  // Ensure that we test stack and heap allocation for strings with in-situ
+  // capacity
+  testIsRelocatable<std::string>("1");
+  testIsRelocatable<std::string>(sizeof(std::string) + 1, 'x');
+
+  testIsRelocatable<std::vector<char>>(5, 'g');
+}
+
+struct membership_no {};
+struct membership_yes { using x = void; };
+FOLLY_CREATE_HAS_MEMBER_TYPE_TRAITS(has_member_type_x, x);
+
+TEST(Traits, has_member_type) {
+  EXPECT_FALSE(bool(has_member_type_x<membership_no>::value));
+  EXPECT_TRUE(bool(has_member_type_x<membership_yes>::value));
 }

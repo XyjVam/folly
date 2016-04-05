@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,13 +21,13 @@
 #include <stdexcept>
 #include <vector>
 
-#include <folly/Optional.h>
-#include <folly/SmallLocks.h>
-
-#include <folly/futures/Try.h>
-#include <folly/futures/Promise.h>
-#include <folly/futures/Future.h>
 #include <folly/Executor.h>
+#include <folly/Function.h>
+#include <folly/MicroSpinLock.h>
+#include <folly/Optional.h>
+#include <folly/futures/Future.h>
+#include <folly/futures/Promise.h>
+#include <folly/futures/Try.h>
 #include <folly/futures/detail/FSM.h>
 
 #include <folly/io/async/Request.h>
@@ -68,19 +68,27 @@ enum class State : uint8_t {
 /// migrate between threads, though this usually happens within the API code.
 /// For example, an async operation will probably make a Promise, grab its
 /// Future, then move the Promise into another thread that will eventually
-/// fulfil it. With executors and via, this gets slightly more complicated at
+/// fulfill it. With executors and via, this gets slightly more complicated at
 /// first blush, but it's the same principle. In general, as long as the user
 /// doesn't access a Future or Promise object from more than one thread at a
 /// time there won't be any problems.
 template<typename T>
 class Core {
+  static_assert(!std::is_void<T>::value,
+                "void futures are not supported. Use Unit instead.");
  public:
   /// This must be heap-constructed. There's probably a way to enforce that in
   /// code but since this is just internal detail code and I don't know how
   /// off-hand, I'm punting.
-  Core() {}
+  Core() : result_(), fsm_(State::Start), attached_(2) {}
+
+  explicit Core(Try<T>&& t)
+    : result_(std::move(t)),
+      fsm_(State::OnlyResult),
+      attached_(1) {}
+
   ~Core() {
-    assert(detached_ == 2);
+    DCHECK(attached_ == 0);
   }
 
   // not copyable
@@ -90,6 +98,26 @@ class Core {
   // not movable (see comment in the implementation of Future::then)
   Core(Core&&) noexcept = delete;
   Core& operator=(Core&&) = delete;
+
+  // Core is assumed to be convertible only if the type is convertible
+  // and the size is the same. This is a compromise for the complexity
+  // of having to make Core truly have a conversion constructor which
+  // would cause various other problems.
+  // If we made Core move constructible then we would need to update the
+  // Promise and Future with the location of the new Core. This is complex
+  // and may be inefficient.
+  // Core should only be modified so that for size(T) == size(U),
+  // sizeof(Core<T>) == size(Core<U>).
+  // This assumption is used as a proxy to make sure that
+  // the members of Core<T> and Core<U> line up so that we can use a
+  // reinterpret cast.
+  template <
+      class U,
+      typename = typename std::enable_if<std::is_convertible<U, T>::value &&
+                                         sizeof(U) == sizeof(T)>::type>
+  static Core<T>* convert(Core<U>* from) {
+    return reinterpret_cast<Core<T>*>(from);
+  }
 
   /// May call from any thread
   bool hasResult() const {
@@ -178,7 +206,7 @@ class Core {
 
   /// Called by a destructing Future (in the Future thread, by definition)
   void detachFuture() {
-    activateNoDeprecatedWarning();
+    activate();
     detachOne();
   }
 
@@ -186,28 +214,39 @@ class Core {
   void detachPromise() {
     // detachPromise() and setResult() should never be called in parallel
     // so we don't need to protect this.
-    if (!result_) {
-      setResult(Try<T>(exception_wrapper(BrokenPromise())));
+    if (UNLIKELY(!result_)) {
+      setResult(Try<T>(exception_wrapper(BrokenPromise(typeid(T).name()))));
     }
     detachOne();
   }
 
   /// May call from any thread
-  void deactivate() DEPRECATED {
-    active_ = false;
+  void deactivate() {
+    active_.store(false, std::memory_order_release);
   }
 
   /// May call from any thread
-  void activate() DEPRECATED {
-    activateNoDeprecatedWarning();
+  void activate() {
+    active_.store(true, std::memory_order_release);
+    maybeCallback();
   }
 
   /// May call from any thread
-  bool isActive() { return active_; }
+  bool isActive() { return active_.load(std::memory_order_acquire); }
 
   /// Call only from Future thread
-  void setExecutor(Executor* x) {
+  void setExecutor(Executor* x, int8_t priority = Executor::MID_PRI) {
+    if (!executorLock_.try_lock()) {
+      executorLock_.lock();
+    }
     executor_ = x;
+    priority_ = priority;
+    executorLock_.unlock();
+  }
+
+  void setExecutorNoLock(Executor* x, int8_t priority = Executor::MID_PRI) {
+    executor_ = x;
+    priority_ = priority;
   }
 
   Executor* getExecutor() {
@@ -216,39 +255,57 @@ class Core {
 
   /// Call only from Future thread
   void raise(exception_wrapper e) {
-    std::lock_guard<decltype(interruptLock_)> guard(interruptLock_);
+    if (!interruptLock_.try_lock()) {
+      interruptLock_.lock();
+    }
     if (!interrupt_ && !hasResult()) {
       interrupt_ = folly::make_unique<exception_wrapper>(std::move(e));
       if (interruptHandler_) {
         interruptHandler_(*interrupt_);
       }
     }
+    interruptLock_.unlock();
+  }
+
+  std::function<void(exception_wrapper const&)> getInterruptHandler() {
+    if (!interruptHandlerSet_.load(std::memory_order_acquire)) {
+      return nullptr;
+    }
+    if (!interruptLock_.try_lock()) {
+      interruptLock_.lock();
+    }
+    auto handler = interruptHandler_;
+    interruptLock_.unlock();
+    return handler;
   }
 
   /// Call only from Promise thread
   void setInterruptHandler(std::function<void(exception_wrapper const&)> fn) {
-    std::lock_guard<decltype(interruptLock_)> guard(interruptLock_);
+    if (!interruptLock_.try_lock()) {
+      interruptLock_.lock();
+    }
     if (!hasResult()) {
       if (interrupt_) {
         fn(*interrupt_);
       } else {
-        interruptHandler_ = std::move(fn);
+        setInterruptHandlerNoLock(std::move(fn));
       }
     }
+    interruptLock_.unlock();
+  }
+
+  void setInterruptHandlerNoLock(
+      std::function<void(exception_wrapper const&)> fn) {
+    interruptHandlerSet_.store(true, std::memory_order_relaxed);
+    interruptHandler_ = std::move(fn);
   }
 
  protected:
-  void activateNoDeprecatedWarning() {
-    active_ = true;
-    maybeCallback();
-  }
-
   void maybeCallback() {
     FSM_START(fsm_)
       case State::Armed:
-        if (active_) {
-          FSM_UPDATE2(fsm_, State::Done, []{},
-                                         std::bind(&Core::doCallback, this));
+        if (active_.load(std::memory_order_acquire)) {
+          FSM_UPDATE2(fsm_, State::Done, []{}, [this]{ this->doCallback(); });
         }
         FSM_BREAK
 
@@ -258,97 +315,159 @@ class Core {
   }
 
   void doCallback() {
-    // TODO(5306911) we should probably try/catch around the callback
-
-    RequestContext::setContext(context_);
-
-    // TODO(6115514) semantic race on reading executor_ and setExecutor()
     Executor* x = executor_;
+    int8_t priority;
     if (x) {
-      MoveWrapper<std::function<void(Try<T>&&)>> cb(std::move(callback_));
-      MoveWrapper<Try<T>> val(std::move(*result_));
-      x->add([cb, val]() mutable { (*cb)(std::move(*val)); });
+      if (!executorLock_.try_lock()) {
+        executorLock_.lock();
+      }
+      x = executor_;
+      priority = priority_;
+      executorLock_.unlock();
+    }
+
+    // keep Core alive until callback did its thing
+    ++attached_;
+
+    if (x) {
+      try {
+        if (LIKELY(x->getNumPriorities() == 1)) {
+          x->add([this]() mutable {
+            SCOPE_EXIT { detachOne(); };
+            RequestContext::setContext(context_);
+            SCOPE_EXIT { callback_ = {}; };
+            callback_(std::move(*result_));
+          });
+        } else {
+          x->addWithPriority([this]() mutable {
+            SCOPE_EXIT { detachOne(); };
+            RequestContext::setContext(context_);
+            SCOPE_EXIT { callback_ = {}; };
+            callback_(std::move(*result_));
+          }, priority);
+        }
+      } catch (...) {
+        --attached_; // Account for extra ++attached_ before try
+        RequestContext::setContext(context_);
+        result_ = Try<T>(exception_wrapper(std::current_exception()));
+        SCOPE_EXIT { callback_ = {}; };
+        callback_(std::move(*result_));
+      }
     } else {
+      SCOPE_EXIT { detachOne(); };
+      RequestContext::setContext(context_);
+      SCOPE_EXIT { callback_ = {}; };
       callback_(std::move(*result_));
     }
   }
 
   void detachOne() {
-    auto d = ++detached_;
-    assert(d >= 1);
-    assert(d <= 2);
-    if (d == 2) {
+    auto a = --attached_;
+    assert(a >= 0);
+    assert(a <= 2);
+    if (a == 0) {
       delete this;
     }
   }
 
-  FSM<State> fsm_ {State::Start};
-  std::atomic<unsigned char> detached_ {0};
+  // Core should only be modified so that for size(T) == size(U),
+  // sizeof(Core<T>) == size(Core<U>).
+  // See Core::convert for details.
+
+  folly::Function<
+      void(Try<T>&&),
+      folly::FunctionMoveCtor::MAY_THROW,
+      8 * sizeof(void*)>
+      callback_;
+  // place result_ next to increase the likelihood that the value will be
+  // contained entirely in one cache line
+  folly::Optional<Try<T>> result_;
+  FSM<State> fsm_;
+  std::atomic<unsigned char> attached_;
   std::atomic<bool> active_ {true};
+  std::atomic<bool> interruptHandlerSet_ {false};
   folly::MicroSpinLock interruptLock_ {0};
-  folly::Optional<Try<T>> result_ {};
-  std::function<void(Try<T>&&)> callback_ {nullptr};
+  folly::MicroSpinLock executorLock_ {0};
+  int8_t priority_ {-1};
+  Executor* executor_ {nullptr};
   std::shared_ptr<RequestContext> context_ {nullptr};
-  std::atomic<Executor*> executor_ {nullptr};
   std::unique_ptr<exception_wrapper> interrupt_ {};
   std::function<void(exception_wrapper const&)> interruptHandler_ {nullptr};
 };
 
 template <typename... Ts>
-struct VariadicContext {
-  VariadicContext() : total(0), count(0) {}
-  Promise<std::tuple<Try<Ts>... > > p;
-  std::tuple<Try<Ts>... > results;
-  size_t total;
-  std::atomic<size_t> count;
+struct CollectAllVariadicContext {
+  CollectAllVariadicContext() {}
+  template <typename T, size_t I>
+  inline void setPartialResult(Try<T>& t) {
+    std::get<I>(results) = std::move(t);
+  }
+  ~CollectAllVariadicContext() {
+    p.setValue(std::move(results));
+  }
+  Promise<std::tuple<Try<Ts>...>> p;
+  std::tuple<Try<Ts>...> results;
   typedef Future<std::tuple<Try<Ts>...>> type;
 };
 
-template <typename... Ts, typename THead, typename... Fs>
-typename std::enable_if<sizeof...(Fs) == 0, void>::type
-whenAllVariadicHelper(VariadicContext<Ts...> *ctx, THead&& head, Fs&&... tail) {
-  head.setCallback_([ctx](Try<typename THead::value_type>&& t) {
-    std::get<sizeof...(Ts) - sizeof...(Fs) - 1>(ctx->results) = std::move(t);
-    if (++ctx->count == ctx->total) {
-      ctx->p.setValue(std::move(ctx->results));
-      delete ctx;
-    }
-  });
-}
-
-template <typename... Ts, typename THead, typename... Fs>
-typename std::enable_if<sizeof...(Fs) != 0, void>::type
-whenAllVariadicHelper(VariadicContext<Ts...> *ctx, THead&& head, Fs&&... tail) {
-  head.setCallback_([ctx](Try<typename THead::value_type>&& t) {
-    std::get<sizeof...(Ts) - sizeof...(Fs) - 1>(ctx->results) = std::move(t);
-    if (++ctx->count == ctx->total) {
-      ctx->p.setValue(std::move(ctx->results));
-      delete ctx;
-    }
-  });
-  // template tail-recursion
-  whenAllVariadicHelper(ctx, std::forward<Fs>(tail)...);
-}
-
-template <typename T>
-struct WhenAllContext {
-  WhenAllContext() : count(0) {}
-  Promise<std::vector<Try<T> > > p;
-  std::vector<Try<T> > results;
-  std::atomic<size_t> count;
-};
-
-template <typename T>
-struct WhenAnyContext {
-  explicit WhenAnyContext(size_t n) : done(false), ref_count(n) {};
-  Promise<std::pair<size_t, Try<T>>> p;
-  std::atomic<bool> done;
-  std::atomic<size_t> ref_count;
-  void decref() {
-    if (--ref_count == 0) {
-      delete this;
+template <typename... Ts>
+struct CollectVariadicContext {
+  CollectVariadicContext() {}
+  template <typename T, size_t I>
+  inline void setPartialResult(Try<T>& t) {
+    if (t.hasException()) {
+       if (!threw.exchange(true)) {
+         p.setException(std::move(t.exception()));
+       }
+     } else if (!threw) {
+       std::get<I>(results) = std::move(t);
+     }
+  }
+  ~CollectVariadicContext() {
+    if (!threw.exchange(true)) {
+      p.setValue(unwrap(std::move(results)));
     }
   }
+  Promise<std::tuple<Ts...>> p;
+  std::tuple<folly::Try<Ts>...> results;
+  std::atomic<bool> threw {false};
+  typedef Future<std::tuple<Ts...>> type;
+
+ private:
+  template <typename... Ts2>
+  static std::tuple<Ts...> unwrap(std::tuple<folly::Try<Ts>...>&& o,
+                                  Ts2&&... ts2) {
+    static_assert(sizeof...(ts2) <
+                  std::tuple_size<std::tuple<folly::Try<Ts>...>>::value,
+                  "Non-templated unwrap should be used instead");
+    assert(std::get<sizeof...(ts2)>(o).hasValue());
+
+    return unwrap(std::move(o),
+                  std::forward<Ts2>(ts2)...,
+                  std::move(*std::get<sizeof...(ts2)>(o)));
+  }
+
+  static std::tuple<Ts...> unwrap(std::tuple<folly::Try<Ts>...>&& /* o */,
+                                  Ts&&... ts) {
+    return std::tuple<Ts...>(std::forward<Ts>(ts)...);
+  }
 };
+
+template <template <typename...> class T, typename... Ts>
+void collectVariadicHelper(const std::shared_ptr<T<Ts...>>& /* ctx */) {
+  // base case
+}
+
+template <template <typename ...> class T, typename... Ts,
+          typename THead, typename... TTail>
+void collectVariadicHelper(const std::shared_ptr<T<Ts...>>& ctx,
+                           THead&& head, TTail&&... tail) {
+  head.setCallback_([ctx](Try<typename THead::value_type>&& t) {
+    ctx->template setPartialResult<typename THead::value_type,
+                                   sizeof...(Ts) - sizeof...(TTail) - 1>(t);
+  });
+  // template tail-recursion
+  collectVariadicHelper(ctx, std::forward<TTail>(tail)...);
+}
 
 }} // folly::detail

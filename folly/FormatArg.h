@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_FORMATARG_H_
-#define FOLLY_FORMATARG_H_
+#pragma once
 
 #include <stdexcept>
 #include <folly/Conv.h>
@@ -48,6 +47,7 @@ struct FormatArg {
       thousandsSeparator(false),
       trailingDot(false),
       width(kDefaultWidth),
+      widthIndex(kNoIndex),
       precision(kDefaultPrecision),
       presentation(kDefaultPresentation),
       nextKeyMode_(NextKeyMode::NONE) {
@@ -81,7 +81,7 @@ struct FormatArg {
   template <typename... Args>
   std::string errorStr(Args&&... args) const;
   template <typename... Args>
-  FOLLY_NORETURN void error(Args&&... args) const;
+  [[noreturn]] void error(Args&&... args) const;
 
   /**
    * Full argument string, as passed in to the constructor.
@@ -135,10 +135,13 @@ struct FormatArg {
   bool trailingDot;
 
   /**
-   * Field width
+   * Field width and optional argument index
    */
   static constexpr int kDefaultWidth = -1;
+  static constexpr int kDynamicWidth = -2;
+  static constexpr int kNoIndex = -1;
   int width;
+  int widthIndex;
 
   /**
    * Precision
@@ -271,5 +274,3 @@ inline int FormatArg::splitIntKey() {
 }
 
 }  // namespace folly
-
-#endif /* FOLLY_FORMATARG_H_ */

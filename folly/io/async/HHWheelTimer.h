@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <folly/Optional.h>
 #include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/DelayedDestruction.h>
 
@@ -33,7 +34,7 @@ namespace folly {
  * Hashed Hierarchical Wheel Timer
  *
  * Comparison:
- * TAsyncTimeout - a single timeout.
+ * AsyncTimeout - a single timeout.
  * HHWheelTimer - a set of efficient timeouts with different interval,
  *    but timeouts are not exact.
  *
@@ -58,7 +59,14 @@ namespace folly {
 class HHWheelTimer : private folly::AsyncTimeout,
                      public folly::DelayedDestruction {
  public:
-  typedef std::unique_ptr<HHWheelTimer, Destructor> UniquePtr;
+  // This type has always been a misnomer, because it is not a unique pointer.
+  using UniquePtr = std::unique_ptr<HHWheelTimer, Destructor>;
+  using SharedPtr = IntrusivePtr<HHWheelTimer>;
+
+  template <typename... Args>
+  static UniquePtr newTimer(Args&&... args) {
+    return UniquePtr(new HHWheelTimer(std::forward<Args>(args)...));
+  }
 
   /**
    * A callback to be notified when a timeout has expired.
@@ -128,6 +136,7 @@ class HHWheelTimer : private folly::AsyncTimeout,
     void cancelTimeoutImpl();
 
     HHWheelTimer* wheel_;
+    folly::Optional<DestructorGuard> wheelGuard_;
     std::chrono::milliseconds expiration_;
 
     typedef boost::intrusive::list_member_hook<
@@ -148,12 +157,22 @@ class HHWheelTimer : private folly::AsyncTimeout,
   };
 
   /**
-   * Create a new HHWheelTimer with the specified interval.
+   * Create a new HHWheelTimer with the specified interval and the
+   * default timeout value set.
+   *
+   * Objects created using this version of constructor can be used
+   * to schedule both variable interval timeouts using
+   * scheduleTimeout(callback, timeout) method, and default
+   * interval timeouts using scheduleTimeout(callback) method.
    */
   static int DEFAULT_TICK_INTERVAL;
-  explicit HHWheelTimer(folly::EventBase* eventBase,
-                        std::chrono::milliseconds intervalMS =
-                        std::chrono::milliseconds(DEFAULT_TICK_INTERVAL));
+  explicit HHWheelTimer(
+      folly::TimeoutManager* timeoutManager,
+      std::chrono::milliseconds intervalMS =
+          std::chrono::milliseconds(DEFAULT_TICK_INTERVAL),
+      AsyncTimeout::InternalEnum internal = AsyncTimeout::InternalEnum::NORMAL,
+      std::chrono::milliseconds defaultTimeoutMS =
+          std::chrono::milliseconds(-1));
 
   /**
    * Destroy the HHWheelTimer.
@@ -161,6 +180,9 @@ class HHWheelTimer : private folly::AsyncTimeout,
    * A HHWheelTimer should only be destroyed when there are no more
    * callbacks pending in the set. (If it helps you may use cancelAll() to
    * cancel all pending timeouts explicitly before calling this.)
+   *
+   * However, it is OK to invoke this function (or via UniquePtr dtor) while
+   * there are outstanding DestructorGuard's or HHWheelTimer::SharedPtr's.
    */
   virtual void destroy();
 
@@ -181,6 +203,15 @@ class HHWheelTimer : private folly::AsyncTimeout,
   }
 
   /**
+   * Get the default timeout interval for this HHWheelTimer.
+   *
+   * Returns the timeout interval in milliseconds.
+   */
+  std::chrono::milliseconds getDefaultTimeout() const {
+    return defaultTimeout_;
+  }
+
+  /**
    * Schedule the specified Callback to be invoked after the
    * specified timeout interval.
    *
@@ -191,6 +222,18 @@ class HHWheelTimer : private folly::AsyncTimeout,
                        std::chrono::milliseconds timeout);
   void scheduleTimeoutImpl(Callback* callback,
                        std::chrono::milliseconds timeout);
+
+  /**
+   * Schedule the specified Callback to be invoked after the
+   * fefault timeout interval.
+   *
+   * If the callback is already scheduled, this cancels the existing timeout
+   * before scheduling the new timeout.
+   *
+   * This method uses CHECK() to make sure that the default timeout was
+   * specified on the object initialization.
+   */
+  void scheduleTimeout(Callback* callback);
 
   template <class F>
   void scheduleTimeoutFn(F fn, std::chrono::milliseconds timeout) {
@@ -256,10 +299,11 @@ class HHWheelTimer : private folly::AsyncTimeout,
   HHWheelTimer(HHWheelTimer const &) = delete;
   HHWheelTimer& operator=(HHWheelTimer const &) = delete;
 
-  // Methods inherited from TAsyncTimeout
+  // Methods inherited from AsyncTimeout
   virtual void timeoutExpired() noexcept;
 
   std::chrono::milliseconds interval_;
+  std::chrono::milliseconds defaultTimeout_;
 
   static constexpr int WHEEL_BUCKETS = 4;
   static constexpr int WHEEL_BITS = 8;

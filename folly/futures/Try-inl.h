@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 namespace folly {
 
 template <class T>
-Try<T>::Try(Try<T>&& t) : contains_(t.contains_) {
+Try<T>::Try(Try<T>&& t) noexcept : contains_(t.contains_) {
   if (contains_ == Contains::VALUE) {
     new (&value_)T(std::move(t.value_));
   } else if (contains_ == Contains::EXCEPTION) {
@@ -32,7 +32,26 @@ Try<T>::Try(Try<T>&& t) : contains_(t.contains_) {
 }
 
 template <class T>
-Try<T>& Try<T>::operator=(Try<T>&& t) {
+template <class T2>
+Try<T>::Try(typename std::enable_if<std::is_same<Unit, T2>::value,
+                                    Try<void> const&>::type t)
+    : contains_(Contains::NOTHING) {
+  if (t.hasValue()) {
+    contains_ = Contains::VALUE;
+    new (&value_) T();
+  } else if (t.hasException()) {
+    contains_ = Contains::EXCEPTION;
+    new (&e_) std::unique_ptr<exception_wrapper>(
+        folly::make_unique<exception_wrapper>(t.exception()));
+  }
+}
+
+template <class T>
+Try<T>& Try<T>::operator=(Try<T>&& t) noexcept {
+  if (this == &t) {
+    return *this;
+  }
+
   this->~Try();
   contains_ = t.contains_;
   if (contains_ == Contains::VALUE) {
@@ -44,22 +63,58 @@ Try<T>& Try<T>::operator=(Try<T>&& t) {
 }
 
 template <class T>
-Try<T>::~Try() {
+Try<T>::Try(const Try<T>& t) {
+  static_assert(
+      std::is_copy_constructible<T>::value,
+      "T must be copyable for Try<T> to be copyable");
+  contains_ = t.contains_;
   if (contains_ == Contains::VALUE) {
-    value_.~T();
+    new (&value_)T(t.value_);
   } else if (contains_ == Contains::EXCEPTION) {
+    new (&e_)std::unique_ptr<exception_wrapper>();
+    e_ = folly::make_unique<exception_wrapper>(*(t.e_));
+  }
+}
+
+template <class T>
+Try<T>& Try<T>::operator=(const Try<T>& t) {
+  static_assert(
+      std::is_copy_constructible<T>::value,
+      "T must be copyable for Try<T> to be copyable");
+  this->~Try();
+  contains_ = t.contains_;
+  if (contains_ == Contains::VALUE) {
+    new (&value_)T(t.value_);
+  } else if (contains_ == Contains::EXCEPTION) {
+    new (&e_)std::unique_ptr<exception_wrapper>();
+    e_ = folly::make_unique<exception_wrapper>(*(t.e_));
+  }
+  return *this;
+}
+
+template <class T>
+Try<T>::~Try() {
+  if (LIKELY(contains_ == Contains::VALUE)) {
+    value_.~T();
+  } else if (UNLIKELY(contains_ == Contains::EXCEPTION)) {
     e_.~unique_ptr<exception_wrapper>();
   }
 }
 
 template <class T>
-T& Try<T>::value() {
+T& Try<T>::value() & {
   throwIfFailed();
   return value_;
 }
 
 template <class T>
-const T& Try<T>::value() const {
+T&& Try<T>::value() && {
+  throwIfFailed();
+  return std::move(value_);
+}
+
+template <class T>
+const T& Try<T>::value() const & {
   throwIfFailed();
   return value_;
 }
@@ -82,11 +137,11 @@ void Try<void>::throwIfFailed() const {
 }
 
 template <typename T>
-inline T moveFromTry(Try<T>&& t) {
+inline T moveFromTry(Try<T>& t) {
   return std::move(t.value());
 }
 
-inline void moveFromTry(Try<void>&& t) {
+inline void moveFromTry(Try<void>& t) {
   return t.value();
 }
 
@@ -94,7 +149,7 @@ template <typename F>
 typename std::enable_if<
   !std::is_same<typename std::result_of<F()>::type, void>::value,
   Try<typename std::result_of<F()>::type>>::type
-makeTryFunction(F&& f) {
+makeTryWith(F&& f) {
   typedef typename std::result_of<F()>::type ResultType;
   try {
     return Try<ResultType>(f());
@@ -109,7 +164,7 @@ template <typename F>
 typename std::enable_if<
   std::is_same<typename std::result_of<F()>::type, void>::value,
   Try<void>>::type
-makeTryFunction(F&& f) {
+makeTryWith(F&& f) {
   try {
     f();
     return Try<void>();

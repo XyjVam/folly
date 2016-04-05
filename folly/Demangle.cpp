@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,21 +55,6 @@ extern "C" int cplus_demangle_v3_callback(
 
 #endif
 
-namespace {
-
-// glibc doesn't have strlcpy
-size_t my_strlcpy(char* dest, const char* src, size_t size) {
-  size_t len = strlen(src);
-  if (size != 0) {
-    size_t n = std::min(len, size - 1);  // always null terminate!
-    memcpy(dest, src, n);
-    dest[n] = '\0';
-  }
-  return len;
-}
-
-}  // namespace
-
 namespace folly {
 
 #if FOLLY_HAVE_CPLUS_DEMANGLE_V3_CALLBACK
@@ -119,7 +104,7 @@ size_t demangle(const char* name, char* out, size_t outSize) {
       demangleCallback,
       &dbuf);
   if (status == 0) {  // failed, return original
-    return my_strlcpy(out, name, outSize);
+    return folly::strlcpy(out, name, outSize);
   }
   if (outSize != 0) {
     *dbuf.dest = '\0';
@@ -134,9 +119,19 @@ fbstring demangle(const char* name) {
 }
 
 size_t demangle(const char* name, char* out, size_t outSize) {
-  return my_strlcpy(out, name, outSize);
+  return folly::strlcpy(out, name, outSize);
 }
 
 #endif
+
+size_t strlcpy(char* dest, const char* const src, size_t size) {
+  size_t len = strlen(src);
+  if (size != 0) {
+    size_t n = std::min(len, size - 1);  // always null terminate!
+    memcpy(dest, src, n);
+    dest[n] = '\0';
+  }
+  return len;
+}
 
 } // folly

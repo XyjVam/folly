@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,8 +24,12 @@ void* (*rallocx)(void*, size_t, int) = nullptr;
 size_t (*xallocx)(void*, size_t, size_t, int) = nullptr;
 size_t (*sallocx)(const void*, int) = nullptr;
 void (*dallocx)(void*, int) = nullptr;
+void (*sdallocx)(void*, size_t, int) = nullptr;
 size_t (*nallocx)(size_t, int) = nullptr;
 int (*mallctl)(const char*, void*, size_t*, void*, size_t) = nullptr;
+int (*mallctlnametomib)(const char*, size_t*, size_t*) = nullptr;
+int (*mallctlbymib)(const size_t*, size_t, void*, size_t*, void*, size_t) =
+    nullptr;
 #endif
 
 }

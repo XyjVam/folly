@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,8 +42,7 @@
  * @author Tudor Bosman (tudorb@facebook.com)
  */
 
-#ifndef FOLLY_FINGERPRINT_H_
-#define FOLLY_FINGERPRINT_H_
+#pragma once
 
 #include <cstdint>
 
@@ -74,7 +73,7 @@ class Fingerprint {
  public:
   Fingerprint() {
     // Use a non-zero starting value. We'll use (1 << (BITS-1))
-    fp_[0] = 1UL << 63;
+    fp_[0] = 1ULL << 63;
     for (int i = 1; i < size(); i++)
       fp_[i] = 0;
   }
@@ -261,5 +260,3 @@ inline uint64_t Fingerprint<128>::shlor64(uint64_t v) {
 }
 
 }  // namespace folly
-
-#endif /* FOLLY_FINGERPRINT_H_ */

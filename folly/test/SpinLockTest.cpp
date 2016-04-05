@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,8 +15,12 @@
  */
 #include <folly/SpinLock.h>
 
+#include <folly/Random.h>
+
 #include <gtest/gtest.h>
 #include <thread>
+
+#include <folly/portability/Asm.h>
 
 using folly::SpinLockGuardImpl;
 
@@ -35,9 +39,9 @@ struct LockedVal {
 template <typename LOCK>
 void spinlockTestThread(LockedVal<LOCK>* v) {
   const int max = 1000;
-  unsigned int seed = (uintptr_t)pthread_self();
+  auto rng = folly::ThreadLocalPRNG();
   for (int i = 0; i < max; i++) {
-    asm("pause");
+    folly::asm_pause();
     SpinLockGuardImpl<LOCK> g(v->lock);
 
     int first = v->ar[0];
@@ -45,7 +49,7 @@ void spinlockTestThread(LockedVal<LOCK>* v) {
       EXPECT_EQ(first, v->ar[i]);
     }
 
-    int byte = rand_r(&seed);
+    int byte = folly::Random::rand32(rng);
     memset(v->ar, char(byte), sizeof v->ar);
   }
 }
@@ -62,7 +66,7 @@ struct TryLockState {
 template <typename LOCK>
 void trylockTestThread(TryLockState<LOCK>* state, size_t count) {
   while (true) {
-    asm("pause");
+    folly::asm_pause();
     SpinLockGuardImpl<LOCK> g(state->lock1);
     if (state->obtained >= count) {
       break;
@@ -81,7 +85,7 @@ void trylockTestThread(TryLockState<LOCK>* state, size_t count) {
       auto oldFailed = state->failed;
       while (state->failed == oldFailed && state->obtained < count) {
         state->lock1.unlock();
-        asm("pause");
+        folly::asm_pause();
         state->lock1.lock();
       }
 

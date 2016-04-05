@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,28 @@ TEST(MapUtil, get_default) {
   EXPECT_EQ(2, get_default(m, 1, 42));
   EXPECT_EQ(42, get_default(m, 2, 42));
   EXPECT_EQ(0, get_default(m, 3));
+}
+
+TEST(MapUtil, get_or_throw) {
+  std::map<int, int> m;
+  m[1] = 2;
+  EXPECT_EQ(2, get_or_throw(m, 1));
+  EXPECT_THROW(get_or_throw(m, 2), std::out_of_range);
+}
+
+TEST(MapUtil, get_or_throw_specified) {
+  std::map<int, int> m;
+  m[1] = 2;
+  EXPECT_EQ(2, get_or_throw<std::runtime_error>(m, 1));
+  EXPECT_THROW(get_or_throw<std::runtime_error>(m, 2), std::runtime_error);
+}
+
+TEST(MapUtil, get_optional) {
+  std::map<int, int> m;
+  m[1] = 2;
+  EXPECT_TRUE(get_optional(m, 1).hasValue());
+  EXPECT_EQ(2, get_optional(m, 1).value());
+  EXPECT_FALSE(get_optional(m, 2).hasValue());
 }
 
 TEST(MapUtil, get_ref_default) {

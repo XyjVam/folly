@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <glog/logging.h>
 #include <folly/SocketAddress.h>
 #include <folly/io/ShutdownSocketSet.h>
 #include <folly/io/IOBuf.h>
@@ -28,6 +27,7 @@
 #include <folly/io/async/EventHandler.h>
 #include <folly/io/async/DelayedDestruction.h>
 
+#include <chrono>
 #include <memory>
 #include <map>
 
@@ -61,13 +61,20 @@ namespace folly {
  * responding and no further progress can be made sending the data.
  */
 
+#ifdef _MSC_VER
+// We do a dynamic_cast on this, in
+// AsyncTransportWrapper::getUnderlyingTransport so be safe and
+// force displacements for it. See:
+// https://msdn.microsoft.com/en-us/library/7sf3txa8.aspx
+#pragma vtordisp(push, 2)
+#endif
 class AsyncSocket : virtual public AsyncTransportWrapper {
  public:
   typedef std::unique_ptr<AsyncSocket, Destructor> UniquePtr;
 
   class ConnectCallback {
    public:
-    virtual ~ConnectCallback() {}
+    virtual ~ConnectCallback() = default;
 
     /**
      * connectSuccess() will be invoked when the connection has been
@@ -334,6 +341,12 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
                   std::unique_ptr<folly::IOBuf>&& buf,
                   WriteFlags flags = WriteFlags::NONE) override;
 
+  class WriteRequest;
+  virtual void writeRequest(WriteRequest* req);
+  void writeRequestReady() {
+    handleWrite();
+  }
+
   // Methods inherited from AsyncTransport
   void close() override;
   void closeNow() override;
@@ -357,10 +370,20 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
 
   bool isEorTrackingEnabled() const override { return false; }
 
-  void setEorTracking(bool track) override {}
+  void setEorTracking(bool /*track*/) override {}
 
   bool connecting() const override {
     return (state_ == StateEnum::CONNECTING);
+  }
+
+  virtual bool isClosedByPeer() const {
+    return (state_ == StateEnum::CLOSED &&
+            (readErr_ == READ_EOF || readErr_ == READ_ERROR));
+  }
+
+  virtual bool isClosedBySelf() const {
+    return (state_ == StateEnum::CLOSED &&
+            (readErr_ != READ_EOF && readErr_ != READ_ERROR));
   }
 
   size_t getAppBytesWritten() const override {
@@ -377,6 +400,10 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
 
   size_t getRawBytesReceived() const override {
     return getAppBytesReceived();
+  }
+
+  std::chrono::nanoseconds getConnectTime() const {
+    return connectEndTime_ - connectStartTime_;
   }
 
   // Methods controlling socket options
@@ -438,7 +465,6 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
   #define SO_SET_NAMESPACE        41
   int setTCPProfile(int profd);
 
-
   /**
    * Generic API for reading a socket option.
    *
@@ -469,6 +495,10 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
     return setsockopt(fd_, level, optname, optval, sizeof(T));
   }
 
+  virtual void setPeek(bool peek) {
+    peek_ = peek;
+  }
+
   enum class StateEnum : uint8_t {
     UNINIT,
     CONNECTING,
@@ -477,11 +507,68 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
     ERROR
   };
 
+  void setBufferCallback(BufferCallback* cb);
+
+  /**
+   * A WriteRequest object tracks information about a pending write operation.
+   */
+  class WriteRequest {
+   public:
+    WriteRequest(AsyncSocket* socket, WriteCallback* callback) :
+      socket_(socket), callback_(callback) {}
+
+    virtual void start() {};
+
+    virtual void destroy() = 0;
+
+    virtual bool performWrite() = 0;
+
+    virtual void consume() = 0;
+
+    virtual bool isComplete() = 0;
+
+    WriteRequest* getNext() const {
+      return next_;
+    }
+
+    WriteCallback* getCallback() const {
+      return callback_;
+    }
+
+    uint32_t getTotalBytesWritten() const {
+      return totalBytesWritten_;
+    }
+
+    void append(WriteRequest* next) {
+      assert(next_ == nullptr);
+      next_ = next;
+    }
+
+    void fail(const char* fn, const AsyncSocketException& ex) {
+      socket_->failWrite(fn, ex);
+    }
+
+    void bytesWritten(size_t count) {
+      totalBytesWritten_ += count;
+      socket_->appBytesWritten_ += count;
+    }
+
+   protected:
+    // protected destructor, to ensure callers use destroy()
+    virtual ~WriteRequest() {}
+
+    AsyncSocket* socket_;         ///< parent socket
+    WriteRequest* next_{nullptr};          ///< pointer to next WriteRequest
+    WriteCallback* callback_;     ///< completion callback
+    uint32_t totalBytesWritten_{0};  ///< total bytes written
+  };
+
  protected:
   enum ReadResultEnum {
     READ_EOF = 0,
     READ_ERROR = -1,
     READ_BLOCKING = -2,
+    READ_NO_ERROR = -3,
   };
 
   /**
@@ -516,7 +603,7 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
     SHUT_READ = 0x04,
   };
 
-  class WriteRequest;
+  class BytesWriteRequest;
 
   class WriteTimeout : public AsyncTimeout {
    public:
@@ -551,10 +638,32 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
 
   void init();
 
+  class ImmediateReadCB : public folly::EventBase::LoopCallback {
+   public:
+    explicit ImmediateReadCB(AsyncSocket* socket) : socket_(socket) {}
+    void runLoopCallback() noexcept override {
+      DestructorGuard dg(socket_);
+      socket_->checkForImmediateRead();
+    }
+   private:
+    AsyncSocket* socket_;
+  };
+
+  /**
+   * Schedule checkForImmediateRead to be executed in the next loop
+   * iteration.
+   */
+  void scheduleImmediateRead() noexcept {
+    if (good()) {
+      eventBase_->runInLoop(&immediateReadHandler_);
+    }
+  }
+
   // event notification methods
   void ioReady(uint16_t events) noexcept;
   virtual void checkForImmediateRead() noexcept;
   virtual void handleInitialReadWrite() noexcept;
+  virtual void prepareReadBuffer(void** buf, size_t* buflen) noexcept;
   virtual void handleRead() noexcept;
   virtual void handleWrite() noexcept;
   virtual void handleConnect() noexcept;
@@ -570,7 +679,7 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
    * READ_ERROR on error, or READ_BLOCKING if the operation will
    * block.
    */
-  virtual ssize_t performRead(void* buf, size_t buflen);
+  virtual ssize_t performRead(void** buf, size_t* buflen, size_t* offset);
 
   /**
    * Populate an iovec array from an IOBuf and attempt to write it.
@@ -655,6 +764,8 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
                  const AsyncSocketException& ex);
   void failWrite(const char* fn, const AsyncSocketException& ex);
   void failAllWrites(const AsyncSocketException& ex);
+  void invokeConnectErr(const AsyncSocketException& ex);
+  void invokeConnectSuccess();
   void invalidState(ConnectCallback* callback);
   void invalidState(ReadCallback* callback);
   void invalidState(WriteCallback* callback);
@@ -665,13 +776,15 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
   uint8_t shutdownFlags_;               ///< Shutdown state (ShutdownFlags)
   uint16_t eventFlags_;                 ///< EventBase::HandlerFlags settings
   int fd_;                              ///< The socket file descriptor
-  mutable
-    folly::SocketAddress addr_;    ///< The address we tried to connect to
+  mutable folly::SocketAddress addr_;    ///< The address we tried to connect to
+  mutable folly::SocketAddress localAddr_;
+                                        ///< The address we are connecting from
   uint32_t sendTimeout_;                ///< The send timeout, in milliseconds
   uint16_t maxReadsPerEvent_;           ///< Max reads per event loop iteration
-  EventBase* eventBase_;               ///< The EventBase
+  EventBase* eventBase_;                ///< The EventBase
   WriteTimeout writeTimeout_;           ///< A timeout for connect and write
   IoHandler ioHandler_;                 ///< A EventHandler to monitor the fd
+  ImmediateReadCB immediateReadHandler_; ///< LoopCallback for checking read
 
   ConnectCallback* connectCallback_;    ///< ConnectCallback
   ReadCallback* readCallback_;          ///< ReadCallback
@@ -680,7 +793,19 @@ class AsyncSocket : virtual public AsyncTransportWrapper {
   ShutdownSocketSet* shutdownSocketSet_;
   size_t appBytesReceived_;             ///< Num of bytes received from socket
   size_t appBytesWritten_;              ///< Num of bytes written to socket
-};
+  bool isBufferMovable_{false};
 
+  bool peek_{false}; // Peek bytes.
+
+  int8_t readErr_{READ_NO_ERROR};      ///< The read error encountered, if any.
+
+  std::chrono::steady_clock::time_point connectStartTime_;
+  std::chrono::steady_clock::time_point connectEndTime_;
+
+  BufferCallback* bufferCallback_{nullptr};
+};
+#ifdef _MSC_VER
+#pragma vtordisp(pop)
+#endif
 
 } // folly

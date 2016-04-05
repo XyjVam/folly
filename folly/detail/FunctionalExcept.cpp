@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#include <folly/Portability.h>
+
+// If FOLLY_HAVE_BITS_FUNCTEXCEPT_H is set, this file compiles to
+// nothing.
+
+#if !FOLLY_HAVE_BITS_FUNCTEXCEPT_H
 
 #include <folly/detail/FunctionalExcept.h>
 
@@ -39,3 +46,5 @@ void __throw_bad_alloc() {
 #endif
 
 FOLLY_NAMESPACE_STD_END
+
+#endif

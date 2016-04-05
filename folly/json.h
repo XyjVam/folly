@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,8 +38,9 @@
  * @author Jordan DeLong <delong.j@fb.com>
  */
 
-#ifndef FOLLY_JSON_H_
-#define FOLLY_JSON_H_
+#pragma once
+
+#include <iosfwd>
 
 #include <folly/dynamic.h>
 #include <folly/FBString.h>
@@ -64,6 +65,8 @@ namespace json {
       , allow_nan_inf(false)
       , double_mode(double_conversion::DoubleToStringConverter::SHORTEST)
       , double_num_digits(0) // ignored when mode is SHORTEST
+      , double_fallback(false)
+      , parse_numbers_as_strings(false)
     {}
 
     // If true, keys in an object can be non-strings.  (In strict
@@ -104,6 +107,14 @@ namespace json {
     // toAppend implementation for floating point for more info
     double_conversion::DoubleToStringConverter::DtoaMode double_mode;
     unsigned int double_num_digits;
+
+    // Fallback to double when a value that looks like integer is too big to
+    // fit in an int64_t. Can result in loss a of precision.
+    bool double_fallback;
+
+    // Do not parse numbers. Instead, store them as strings and leave the
+    // conversion up to the user.
+    bool parse_numbers_as_strings;
   };
 
   /*
@@ -148,8 +159,11 @@ fbstring toJson(dynamic const&);
  */
 fbstring toPrettyJson(dynamic const&);
 
+/*
+ * Printer for GTest.
+ * Uppercase name to fill GTest's API, which calls this method through ADL.
+ */
+void PrintTo(const dynamic&, std::ostream*);
 //////////////////////////////////////////////////////////////////////
 
 }
-
-#endif

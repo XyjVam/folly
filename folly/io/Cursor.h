@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_CURSOR_H
-#define FOLLY_CURSOR_H
+#pragma once
 
 #include <assert.h>
 #include <cstdarg>
@@ -108,6 +107,27 @@ class CursorBase {
     return end - *this;
   }
 
+  /**
+   * Return true if the cursor could advance the specified number of bytes
+   * from its current position.
+   * This is useful for applications that want to do checked reads instead of
+   * catching exceptions and is more efficient than using totalLength as it
+   * walks the minimal set of buffers in the chain to determine the result.
+   */
+  bool canAdvance(size_t amount) const {
+    const IOBuf* nextBuf = crtBuf_;
+    size_t available = length();
+    do {
+      if (available >= amount) {
+        return true;
+      }
+      amount -= available;
+      nextBuf = nextBuf->next();
+      available = nextBuf->length();
+    } while (nextBuf != buffer_);
+    return false;
+  }
+
   /*
    * Return true if the cursor is at the end of the entire IOBuf chain.
    */
@@ -162,6 +182,7 @@ class CursorBase {
     if (LIKELY(length() >= sizeof(T))) {
       val = loadUnaligned<T>(data());
       offset_ += sizeof(T);
+      advanceBufferIfEmpty();
     } else {
       pullSlow(&val, sizeof(T));
     }
@@ -191,6 +212,7 @@ class CursorBase {
     if (LIKELY(length() >= len)) {
       str.append(reinterpret_cast<const char*>(data()), len);
       offset_ += len;
+      advanceBufferIfEmpty();
     } else {
       readFixedStringSlow(&str, len);
     }
@@ -210,7 +232,7 @@ class CursorBase {
       size_t maxLength = std::numeric_limits<size_t>::max()) {
     std::string str;
 
-    for (;;) {
+    while (!isAtEnd()) {
       const uint8_t* buf = data();
       size_t buflen = length();
 
@@ -232,16 +254,14 @@ class CursorBase {
       }
 
       skip(i);
-
-      if (UNLIKELY(!tryAdvanceBuffer())) {
-        throw std::out_of_range("string underflow");
-      }
     }
+    throw std::out_of_range("terminator not found");
   }
 
   size_t skipAtMost(size_t len) {
     if (LIKELY(length() >= len)) {
       offset_ += len;
+      advanceBufferIfEmpty();
       return len;
     }
     return skipAtMostSlow(len);
@@ -250,6 +270,7 @@ class CursorBase {
   void skip(size_t len) {
     if (LIKELY(length() >= len)) {
       offset_ += len;
+      advanceBufferIfEmpty();
     } else {
       skipSlow(len);
     }
@@ -260,6 +281,7 @@ class CursorBase {
     if (LIKELY(length() >= len)) {
       memcpy(buf, data(), len);
       offset_ += len;
+      advanceBufferIfEmpty();
       return len;
     }
     return pullAtMostSlow(buf, len);
@@ -269,6 +291,7 @@ class CursorBase {
     if (LIKELY(length() >= len)) {
       memcpy(buf, data(), len);
       offset_ += len;
+      advanceBufferIfEmpty();
     } else {
       pullSlow(buf, len);
     }
@@ -321,6 +344,7 @@ class CursorBase {
         }
 
         offset_ += len;
+        advanceBufferIfEmpty();
         return copied + len;
       }
 
@@ -419,6 +443,12 @@ class CursorBase {
     return true;
   }
 
+  void advanceBufferIfEmpty() {
+    if (length() == 0) {
+      tryAdvanceBuffer();
+    }
+  }
+
   BufType* crtBuf_;
   size_t offset_ = 0;
 
@@ -433,6 +463,7 @@ class CursorBase {
     }
     str->append(reinterpret_cast<const char*>(data()), len);
     offset_ += len;
+    advanceBufferIfEmpty();
   }
 
   size_t pullAtMostSlow(void* buf, size_t len) {
@@ -449,6 +480,7 @@ class CursorBase {
     }
     memcpy(p, data(), len);
     offset_ += len;
+    advanceBufferIfEmpty();
     return copied + len;
   }
 
@@ -468,6 +500,7 @@ class CursorBase {
       len -= available;
     }
     offset_ += len;
+    advanceBufferIfEmpty();
     return skipped + len;
   }
 
@@ -888,5 +921,3 @@ class QueueAppender : public detail::Writable<QueueAppender> {
 };
 
 }}  // folly::io
-
-#endif // FOLLY_CURSOR_H

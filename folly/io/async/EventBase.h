@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,26 +16,33 @@
 
 #pragma once
 
-#include <glog/logging.h>
-#include <folly/io/async/AsyncTimeout.h>
-#include <folly/io/async/TimeoutManager.h>
-#include <folly/io/async/Request.h>
-#include <folly/Executor.h>
-#include <folly/futures/DrivableExecutor.h>
-#include <memory>
-#include <stack>
-#include <list>
-#include <queue>
+#include <atomic>
 #include <cstdlib>
+#include <errno.h>
+#include <functional>
+#include <list>
+#include <math.h>
+#include <memory>
+#include <mutex>
+#include <queue>
 #include <set>
+#include <stack>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+
 #include <boost/intrusive/list.hpp>
 #include <boost/utility.hpp>
-#include <functional>
+#include <folly/Executor.h>
+#include <folly/Portability.h>
+#include <folly/experimental/ExecutionObserver.h>
+#include <folly/futures/DrivableExecutor.h>
+#include <folly/io/async/AsyncTimeout.h>
+#include <folly/io/async/Request.h>
+#include <folly/io/async/TimeoutManager.h>
+#include <glog/logging.h>
+
 #include <event.h>  // libevent
-#include <errno.h>
-#include <math.h>
-#include <atomic>
 
 namespace folly {
 
@@ -43,9 +50,21 @@ typedef std::function<void()> Cob;
 template <typename MessageT>
 class NotificationQueue;
 
+namespace detail {
+class EventBaseLocalBase;
+
+class EventBaseLocalBaseBase {
+ public:
+  virtual void onEventBaseDestruction(EventBase& evb) = 0;
+  virtual ~EventBaseLocalBaseBase() = default;
+};
+}
+template <typename T>
+class EventBaseLocal;
+
 class EventBaseObserver {
  public:
-  virtual ~EventBaseObserver() {}
+  virtual ~EventBaseObserver() = default;
 
   virtual uint32_t getSampleRate() const = 0;
 
@@ -113,7 +132,7 @@ class EventBase : private boost::noncopyable,
    */
   class LoopCallback {
    public:
-    virtual ~LoopCallback() {}
+    virtual ~LoopCallback() = default;
 
     virtual void runLoopCallback() noexcept = 0;
     void cancelLoopCallback() {
@@ -302,6 +321,15 @@ class EventBase : private boost::noncopyable,
   void runOnDestruction(LoopCallback* callback);
 
   /**
+   * Adds the given callback to a queue of things run after the notification
+   * queue is drained before the destruction of current EventBase.
+   *
+   * Note: will be called from the thread that invoked EventBase destructor,
+   *       after the final run of loop callbacks.
+   */
+  void runAfterDrain(Cob&& cob);
+
+  /**
    * Adds a callback that will run immediately *before* the event loop.
    * This is very similar to runInLoop(), but will not cause the loop to break:
    * For example, this callback could be used to get loop times.
@@ -334,13 +362,8 @@ class EventBase : private boost::noncopyable,
    * @return Returns true if the function was successfully scheduled, or false
    *         if there was an error scheduling the function.
    */
-  template<typename T>
-  bool runInEventBaseThread(void (*fn)(T*), T* arg) {
-    return runInEventBaseThread(reinterpret_cast<void (*)(void*)>(fn),
-                                reinterpret_cast<void*>(arg));
-  }
-
-  bool runInEventBaseThread(void (*fn)(void*), void* arg);
+  template <typename T>
+  bool runInEventBaseThread(void (*fn)(T*), T* arg);
 
   /**
    * Run the specified function in the EventBase's thread
@@ -362,25 +385,27 @@ class EventBase : private boost::noncopyable,
    * Like runInEventBaseThread, but the caller waits for the callback to be
    * executed.
    */
-  template<typename T>
-  bool runInEventBaseThreadAndWait(void (*fn)(T*), T* arg) {
-    return runInEventBaseThreadAndWait(reinterpret_cast<void (*)(void*)>(fn),
-                                       reinterpret_cast<void*>(arg));
-  }
-
-  /*
-   * Like runInEventBaseThread, but the caller waits for the callback to be
-   * executed.
-   */
-  bool runInEventBaseThreadAndWait(void (*fn)(void*), void* arg) {
-    return runInEventBaseThreadAndWait(std::bind(fn, arg));
-  }
+  template <typename T>
+  bool runInEventBaseThreadAndWait(void (*fn)(T*), T* arg);
 
   /*
    * Like runInEventBaseThread, but the caller waits for the callback to be
    * executed.
    */
   bool runInEventBaseThreadAndWait(const Cob& fn);
+
+  /*
+   * Like runInEventBaseThreadAndWait, except if the caller is already in the
+   * event base thread, the functor is simply run inline.
+   */
+  template <typename T>
+  bool runImmediatelyOrRunInEventBaseThreadAndWait(void (*fn)(T*), T* arg);
+
+  /*
+   * Like runInEventBaseThreadAndWait, except if the caller is already in the
+   * event base thread, the functor is simply run inline.
+   */
+  bool runImmediatelyOrRunInEventBaseThreadAndWait(const Cob& fn);
 
   /**
    * Runs the given Cob at some time after the specified number of
@@ -390,7 +415,7 @@ class EventBase : private boost::noncopyable,
    */
   void runAfterDelay(
       const Cob& c,
-      int milliseconds,
+      uint32_t milliseconds,
       TimeoutManager::InternalEnum in = TimeoutManager::InternalEnum::NORMAL);
 
   /**
@@ -401,7 +426,7 @@ class EventBase : private boost::noncopyable,
    * */
   bool tryRunAfterDelay(
       const Cob& cob,
-      int milliseconds,
+      uint32_t milliseconds,
       TimeoutManager::InternalEnum in = TimeoutManager::InternalEnum::NORMAL);
 
   /**
@@ -521,6 +546,23 @@ class EventBase : private boost::noncopyable,
   }
 
   /**
+   * Setup execution observation/instrumentation for every EventHandler
+   * executed in this EventBase.
+   *
+   * @param executionObserver   EventHandle's execution observer.
+   */
+  void setExecutionObserver(ExecutionObserver* observer) {
+    executionObserver_ = observer;
+  }
+
+  /**
+   * Gets the execution observer associated with this EventBase.
+   */
+  ExecutionObserver* getExecutionObserver() {
+    return executionObserver_;
+  }
+
+  /**
    * Set the name of the thread that runs this event base.
    */
   void setName(const std::string& name);
@@ -543,14 +585,13 @@ class EventBase : private boost::noncopyable,
   }
 
  private:
-
   // TimeoutManager
   void attachTimeoutManager(AsyncTimeout* obj,
                             TimeoutManager::InternalEnum internal) override;
 
   void detachTimeoutManager(AsyncTimeout* obj) override;
 
-  bool scheduleTimeout(AsyncTimeout* obj, std::chrono::milliseconds timeout)
+  bool scheduleTimeout(AsyncTimeout* obj, TimeoutManager::timeout_type timeout)
     override;
 
   void cancelTimeout(AsyncTimeout* obj) override;
@@ -558,17 +599,6 @@ class EventBase : private boost::noncopyable,
   bool isInTimeoutManagerThread() override {
     return isInEventBaseThread();
   }
-
-  // Helper class used to short circuit runInEventBaseThread
-  class RunInLoopCallback : public LoopCallback {
-   public:
-    RunInLoopCallback(void (*fn)(void*), void* arg);
-    void runLoopCallback() noexcept;
-
-   private:
-    void (*fn_)(void*);
-    void* arg_;
-  };
 
   /*
    * Helper function that tells us whether we have already handled
@@ -578,7 +608,7 @@ class EventBase : private boost::noncopyable,
 
   // --------- libevent callbacks (not for client use) ------------
 
-  static void runFunctionPtr(std::function<void()>* fn);
+  static void runFunctionPtr(Cob* fn);
 
   // small object used as a callback arg with enough info to execute the
   // appropriate client-provided Cob
@@ -619,6 +649,7 @@ class EventBase : private boost::noncopyable,
   LoopCallbackList loopCallbacks_;
   LoopCallbackList runBeforeLoopCallbacks_;
   LoopCallbackList onDestructionCallbacks_;
+  LoopCallbackList runAfterDrainCallbacks_;
 
   // This will be null most of the time, but point to currentCallbacks
   // if we are in the middle of running loop callbacks, such that
@@ -628,7 +659,7 @@ class EventBase : private boost::noncopyable,
 
   // stop_ is set by terminateLoopSoon() and is used by the main loop
   // to determine if it should exit
-  bool stop_;
+  std::atomic<bool> stop_;
 
   // The ID of the thread running the main loop.
   // 0 if loop is not running.
@@ -642,7 +673,7 @@ class EventBase : private boost::noncopyable,
 
   // A notification queue for runInEventBaseThread() to use
   // to send function requests to the EventBase thread.
-  std::unique_ptr<NotificationQueue<std::pair<void (*)(void*), void*>>> queue_;
+  std::unique_ptr<NotificationQueue<Cob>> queue_;
   std::unique_ptr<FunctionRunner> fnRunner_;
 
   // limit for latency in microseconds (0 disables)
@@ -677,8 +708,100 @@ class EventBase : private boost::noncopyable,
   std::shared_ptr<EventBaseObserver> observer_;
   uint32_t observerSampleCount_;
 
+  // EventHandler's execution observer.
+  ExecutionObserver* executionObserver_;
+
   // Name of the thread running this EventBase
   std::string name_;
+
+  // allow runOnDestruction() to be called from any threads
+  std::mutex onDestructionCallbacksMutex_;
+
+  // allow runAfterDrain() to be called from any threads
+  std::mutex runAfterDrainCallbacksMutex_;
+
+  // see EventBaseLocal
+  friend class detail::EventBaseLocalBase;
+  template <typename T> friend class EventBaseLocal;
+  std::mutex localStorageMutex_;
+  std::unordered_map<uint64_t, std::shared_ptr<void>> localStorage_;
+  std::unordered_set<detail::EventBaseLocalBaseBase*> localStorageToDtor_;
 };
 
+namespace detail {
+
+/**
+ * Define a small functor (2 pointers) and specialize
+ * std::__is_location_invariant so that std::function does not require
+ * memory allocation.
+ *
+ *   std::function<void()> func = SmallFunctor{f, p};
+ *
+ * TODO(lucian): remove this hack once GCC <= 4.9 are deprecated.
+ * In GCC >= 5.0 just use a lambda like:
+ *
+ *   std::function<void()> func = [=] { f(p); };
+ *
+ * See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=61909
+ */
+template <class T>
+struct SmallFunctor {
+  void (*fn)(T*);
+  T* p;
+  void operator()() { fn(p); }
+};
+
+} // detail
+
+template <typename T>
+bool EventBase::runInEventBaseThread(void (*fn)(T*), T* arg) {
+  return runInEventBaseThread(detail::SmallFunctor<T>{fn, arg});
+}
+
+template <typename T>
+bool EventBase::runInEventBaseThreadAndWait(void (*fn)(T*), T* arg) {
+  return runInEventBaseThreadAndWait(detail::SmallFunctor<T>{fn, arg});
+}
+
+template <typename T>
+bool EventBase::runImmediatelyOrRunInEventBaseThreadAndWait(void (*fn)(T*),
+                                                            T* arg) {
+  return runImmediatelyOrRunInEventBaseThreadAndWait(
+      detail::SmallFunctor<T>{fn, arg});
+}
+
 } // folly
+
+FOLLY_NAMESPACE_STD_BEGIN
+
+/**
+ * GCC's libstdc++ uses __is_location_invariant to decide wether to
+ * use small object optimization and embed the functor's contents in
+ * the std::function object.
+ *
+ * (gcc 4.9) $ libstdc++-v3/include/std/functional
+ * template<typename _Tp>
+ *   struct __is_location_invariant
+ *   : integral_constant<bool, (is_pointer<_Tp>::value
+ *                              || is_member_pointer<_Tp>::value)>
+ *   { };
+ *
+ * (gcc 5.0) $ libstdc++-v3/include/std/functional
+ *
+ * template<typename _Tp>
+ *      struct __is_location_invariant
+ *      : is_trivially_copyable<_Tp>::type
+ *      { };
+ *
+ *
+ *  NOTE: Forward declare so this doesn't break when using other
+ *  standard libraries: it just wont have any effect.
+ */
+template <typename T>
+struct __is_location_invariant;
+
+template <typename T>
+struct __is_location_invariant<folly::detail::SmallFunctor<T>>
+    : public std::true_type {};
+
+FOLLY_NAMESPACE_STD_END

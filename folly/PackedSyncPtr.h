@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_PACKEDSYNCPTR_H_
-#define FOLLY_PACKEDSYNCPTR_H_
+#pragma once
 
 #include <folly/Portability.h>
 
-#if !FOLLY_X64
-# error "PackedSyncPtr is x64-specific code."
+#if !FOLLY_X64 && !FOLLY_PPC64
+# error "PackedSyncPtr is x64 and ppc64 specific code."
 #endif
 
 /*
@@ -147,5 +146,3 @@ static_assert(sizeof(PackedSyncPtr<void>) == 8,
               "messed up");
 
 }
-
-#endif

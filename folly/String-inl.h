@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_STRING_INL_H_
-#define FOLLY_STRING_INL_H_
+#pragma once
 
 #include <stdexcept>
 #include <iterator>
 
-#ifndef FOLLY_BASE_STRING_H_
+#ifndef FOLLY_STRING_H_
 #error This file may only be included from String.h
 #endif
 
@@ -203,7 +202,6 @@ void uriUnescape(StringPiece str, String& out, UriEscapeMode mode) {
   // this is faster than calling push_back repeatedly.
   while (p != str.end()) {
     char c = *p;
-    unsigned char v = static_cast<unsigned char>(v);
     switch (c) {
     case '%':
       {
@@ -670,5 +668,3 @@ void hexDump(const void* ptr, size_t size, OutIt out) {
 }
 
 }  // namespace folly
-
-#endif /* FOLLY_STRING_INL_H_ */

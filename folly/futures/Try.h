@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,8 +22,9 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/Likely.h>
 #include <folly/Memory.h>
-#include <folly/futures/Deprecated.h>
+#include <folly/Portability.h>
 #include <folly/futures/FutureException.h>
+#include <folly/futures/Unit.h>
 
 namespace folly {
 
@@ -34,8 +35,7 @@ namespace folly {
  * context. Exceptions are stored as exception_wrappers so that the user can
  * minimize rethrows if so desired.
  *
- * There is a specialization, Try<void>, which represents either success
- * or an exception.
+ * To represent success or a captured exception, use Try<Unit>
  */
 template <class T>
 class Try {
@@ -73,6 +73,12 @@ class Try {
    */
   explicit Try(T&& v) : contains_(Contains::VALUE), value_(std::move(v)) {}
 
+  /// Implicit conversion from Try<void> to Try<Unit>
+  template <class T2 = T>
+  /* implicit */
+  Try(typename std::enable_if<std::is_same<Unit, T2>::value,
+                              Try<void> const&>::type t);
+
   /*
    * Construct a Try with an exception_wrapper
    *
@@ -88,7 +94,8 @@ class Try {
    *
    * @param ep The exception_pointer. Will be rethrown.
    */
-  explicit Try(std::exception_ptr ep) DEPRECATED
+  FOLLY_DEPRECATED("use Try(exception_wrapper)")
+  explicit Try(std::exception_ptr ep)
     : contains_(Contains::EXCEPTION) {
     try {
       std::rethrow_exception(ep);
@@ -100,14 +107,14 @@ class Try {
   }
 
   // Move constructor
-  Try(Try<T>&& t);
+  Try(Try<T>&& t) noexcept;
   // Move assigner
-  Try& operator=(Try<T>&& t);
+  Try& operator=(Try<T>&& t) noexcept;
 
-  // Non-copyable
-  Try(const Try<T>& t) = delete;
-  // Non-copyable
-  Try& operator=(const Try<T>& t) = delete;
+  // Copy constructor
+  Try(const Try& t);
+  // Copy assigner
+  Try& operator=(const Try& t);
 
   ~Try();
 
@@ -117,14 +124,21 @@ class Try {
    *
    * @returns mutable reference to the contained value
    */
-  T& value();
+  T& value()&;
+  /*
+   * Get a rvalue reference to the contained value. If the Try contains an
+   * exception it will be rethrown.
+   *
+   * @returns rvalue reference to the contained value
+   */
+  T&& value()&&;
   /*
    * Get a const reference to the contained value. If the Try contains an
    * exception it will be rethrown.
    *
    * @returns const reference to the contained value
    */
-  const T& value() const;
+  const T& value() const&;
 
   /*
    * If the Try contains an exception, rethrow it. Otherwise do nothing.
@@ -202,7 +216,7 @@ class Try {
     if (!hasException()) {
       return false;
     }
-    return e_->with_exception<Ex>(std::move(func));
+    return e_->with_exception(std::move(func));
   }
 
   template <bool isTry, typename R>
@@ -248,7 +262,8 @@ class Try<void> {
    *
    * @param ep The exception_pointer. Will be rethrown.
    */
-  explicit Try(std::exception_ptr ep) DEPRECATED : hasValue_(false) {
+  FOLLY_DEPRECATED("use Try(exception_wrapper)")
+  explicit Try(std::exception_ptr ep) : hasValue_(false) {
     try {
       std::rethrow_exception(ep);
     } catch (const std::exception& e) {
@@ -321,7 +336,7 @@ class Try<void> {
     if (!hasException()) {
       return false;
     }
-    return e_->with_exception<Ex>(std::move(func));
+    return e_->with_exception(std::move(func));
   }
 
   template <bool, typename R>
@@ -342,14 +357,14 @@ class Try<void> {
  * @returns value contained in t
  */
 template <typename T>
-T moveFromTry(Try<T>&& t);
+T moveFromTry(Try<T>& t);
 
 /*
  * Throws if try contained an exception.
  *
  * @param t Try to move from
  */
-void moveFromTry(Try<void>&& t);
+void moveFromTry(Try<void>& t);
 
 /*
  * @param f a function to execute and capture the result of (value or exception)
@@ -360,10 +375,10 @@ template <typename F>
 typename std::enable_if<
   !std::is_same<typename std::result_of<F()>::type, void>::value,
   Try<typename std::result_of<F()>::type>>::type
-makeTryFunction(F&& f);
+makeTryWith(F&& f);
 
 /*
- * Specialization of makeTryFunction for void
+ * Specialization of makeTryWith for void return
  *
  * @param f a function to execute and capture the result of
  *
@@ -373,7 +388,7 @@ template <typename F>
 typename std::enable_if<
   std::is_same<typename std::result_of<F()>::type, void>::value,
   Try<void>>::type
-makeTryFunction(F&& f);
+makeTryWith(F&& f);
 
 } // folly
 

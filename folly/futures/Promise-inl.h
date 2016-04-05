@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,16 +44,19 @@ Promise<T>& Promise<T>::operator=(Promise<T>&& other) noexcept {
 
 template <class T>
 void Promise<T>::throwIfFulfilled() {
-  if (!core_)
+  if (UNLIKELY(!core_)) {
     throw NoState();
-  if (core_->ready())
+  }
+  if (UNLIKELY(core_->ready())) {
     throw PromiseAlreadySatisfied();
+  }
 }
 
 template <class T>
 void Promise<T>::throwIfRetrieved() {
-  if (retrieved_)
+  if (UNLIKELY(retrieved_)) {
     throw FutureAlreadyRetrieved();
+  }
 }
 
 template <class T>
@@ -109,7 +112,7 @@ void Promise<T>::setInterruptHandler(
 }
 
 template <class T>
-void Promise<T>::fulfilTry(Try<T> t) {
+void Promise<T>::setTry(Try<T>&& t) {
   throwIfFulfilled();
   core_->setResult(std::move(t));
 }
@@ -120,22 +123,22 @@ void Promise<T>::setValue(M&& v) {
   static_assert(!std::is_same<T, void>::value,
                 "Use setValue() instead");
 
-  fulfilTry(Try<T>(std::forward<M>(v)));
-}
-
-template <class T>
-void Promise<T>::setValue() {
-  static_assert(std::is_same<T, void>::value,
-                "Use setValue(value) instead");
-
-  fulfilTry(Try<void>());
+  setTry(Try<T>(std::forward<M>(v)));
 }
 
 template <class T>
 template <class F>
-void Promise<T>::fulfil(F&& func) {
+void Promise<T>::setWith(F&& func) {
   throwIfFulfilled();
-  fulfilTry(makeTryFunction(std::forward<F>(func)));
+  setTry(makeTryWith(std::forward<F>(func)));
+}
+
+template <class T>
+bool Promise<T>::isFulfilled() {
+  if (core_) {
+    return core_->hasResult();
+  }
+  return true;
 }
 
 }

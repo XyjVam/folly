@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_EXPERIMENTAL_BITS_H_
-#define FOLLY_EXPERIMENTAL_BITS_H_
+#pragma once
 
 #include <cstddef>
 #include <type_traits>
 #include <limits>
+#include <glog/logging.h>
 
 #include <folly/Bits.h>
 #include <folly/Portability.h>
@@ -57,8 +57,7 @@ struct BitsTraits<Unaligned<T>, typename std::enable_if<
   static T loadRMW(const Unaligned<T>& x) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wuninitialized"
-// make sure we compile without warning on gcc 4.6 with -Wpragmas
-#if __GNUC_PREREQ(4, 7)
+#if !__clang__ // for gcc version [4.8, ?)
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
     return x.value;
@@ -79,8 +78,7 @@ struct BitsTraits<UnalignedNoASan<T>, typename std::enable_if<
   loadRMW(const UnalignedNoASan<T>& x) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wuninitialized"
-// make sure we compile without warning on gcc 4.6 with -Wpragmas
-#if __GNUC_PREREQ(4, 7)
+#if !__clang__ // for gcc version [4.8, ?)
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
     return x.value;
@@ -98,7 +96,7 @@ struct BitsTraits<T, typename std::enable_if<
   static T loadRMW(const T& x) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wuninitialized"
-#if __GNUC_PREREQ(4, 7)
+#if !__clang__ // for gcc version [4.8, ?)
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
     return x;
@@ -205,7 +203,7 @@ struct Bits {
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wuninitialized"
-#if __GNUC_PREREQ(4, 7)
+#if !__clang__ // for gcc version [4.8, ?)
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 
@@ -224,9 +222,9 @@ inline void Bits<T, Traits>::clear(T* p, size_t bit) {
 template <class T, class Traits>
 inline void Bits<T, Traits>::set(T* p, size_t bitStart, size_t count,
                                  UnderlyingType value) {
-  assert(count <= sizeof(UnderlyingType) * 8);
+  DCHECK_LE(count, sizeof(UnderlyingType) * 8);
   size_t cut = bitsPerBlock - count;
-  assert(value == (value << cut >> cut));
+  DCHECK_EQ(value, value << cut >> cut);
   size_t idx = blockIndex(bitStart);
   size_t offset = bitOffset(bitStart);
   if (std::is_signed<UnderlyingType>::value) {
@@ -268,7 +266,7 @@ inline bool Bits<T, Traits>::test(const T* p, size_t bit) {
 template <class T, class Traits>
 inline auto Bits<T, Traits>::get(const T* p, size_t bitStart, size_t count)
   -> UnderlyingType {
-  assert(count <= sizeof(UnderlyingType) * 8);
+  DCHECK_LE(count, sizeof(UnderlyingType) * 8);
   size_t idx = blockIndex(bitStart);
   size_t offset = bitOffset(bitStart);
   UnderlyingType ret;
@@ -305,5 +303,3 @@ inline size_t Bits<T, Traits>::count(const T* begin, const T* end) {
 }
 
 }  // namespace folly
-
-#endif /* FOLLY_EXPERIMENTAL_BITS_H_ */

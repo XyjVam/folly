@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +20,11 @@
 #include <boost/algorithm/string.hpp>
 
 #include <folly/Conv.h>
+#include <folly/Portability.h>
 #include <folly/Range.h>
 #include <folly/String.h>
 #include <folly/Unicode.h>
+#include <folly/portability/Constexpr.h>
 
 namespace folly {
 
@@ -443,7 +445,7 @@ dynamic parseArray(Input& in) {
   assert(*in == '[');
   ++in;
 
-  dynamic ret = {};
+  dynamic ret = dynamic::array;
 
   in.skipWhitespace();
   if (*in == ']') {
@@ -470,8 +472,10 @@ dynamic parseArray(Input& in) {
 
 dynamic parseNumber(Input& in) {
   bool const negative = (*in == '-');
-  if (negative) {
-    if (in.consume("-Infinity")) {
+  if (negative && in.consume("-Infinity")) {
+    if (in.getOpts().parse_numbers_as_strings) {
+      return "-Infinity";
+    } else {
       return -std::numeric_limits<double>::infinity();
     }
   }
@@ -482,10 +486,28 @@ dynamic parseNumber(Input& in) {
   }
 
   auto const wasE = *in == 'e' || *in == 'E';
+
+  constexpr const char* maxInt = "9223372036854775807";
+  constexpr const char* minInt = "9223372036854775808";
+  constexpr auto maxIntLen = constexpr_strlen(maxInt);
+
+
+  if (*in != '.' && !wasE && in.getOpts().parse_numbers_as_strings) {
+    return integral;
+  }
+
   if (*in != '.' && !wasE) {
-    auto val = to<int64_t>(integral);
-    in.skipWhitespace();
-    return val;
+    if (LIKELY(!in.getOpts().double_fallback || integral.size() < maxIntLen) ||
+         (integral.size() == maxIntLen &&
+           (integral <= maxInt || (integral == minInt && negative)))) {
+      auto val = to<int64_t>(integral);
+      in.skipWhitespace();
+      return val;
+    } else {
+      auto val = to<double>(integral);
+      in.skipWhitespace();
+      return val;
+    }
   }
 
   auto end = !wasE ? (++in, in.skipDigits().end()) : in.begin();
@@ -498,7 +520,9 @@ dynamic parseNumber(Input& in) {
     end = expPart.end();
   }
   auto fullNum = range(integral.begin(), end);
-
+  if (in.getOpts().parse_numbers_as_strings) {
+    return fullNum;
+  }
   auto val = to<double>(fullNum);
   return val;
 }
@@ -613,8 +637,12 @@ dynamic parseValue(Input& in) {
          in.consume("true") ? true :
          in.consume("false") ? false :
          in.consume("null") ? nullptr :
-         in.consume("Infinity") ? std::numeric_limits<double>::infinity() :
-         in.consume("NaN") ? std::numeric_limits<double>::quiet_NaN() :
+         in.consume("Infinity") ?
+          (in.getOpts().parse_numbers_as_strings ? (dynamic)"Infinity" :
+            (dynamic)std::numeric_limits<double>::infinity()) :
+         in.consume("NaN") ?
+           (in.getOpts().parse_numbers_as_strings ? (dynamic)"NaN" :
+             (dynamic)std::numeric_limits<double>::quiet_NaN()) :
          in.error("expected json value");
 }
 
@@ -663,7 +691,7 @@ void escapeString(StringPiece input,
         // checking that utf8 encodings are valid
         char32_t v = decodeUtf8(q, e, opts.skip_invalid_utf8);
         if (opts.skip_invalid_utf8 && v == U'\ufffd') {
-          out.append("\ufffd");
+          out.append(u8"\ufffd");
           p = q;
           continue;
         }
@@ -805,6 +833,15 @@ void dynamic::print_as_pseudo_json(std::ostream& out) const {
   opts.allow_non_string_keys = true;
   opts.allow_nan_inf = true;
   out << json::serialize(*this, opts);
+}
+
+void PrintTo(const dynamic& dyn, std::ostream* os) {
+  json::serialization_opts opts;
+  opts.allow_nan_inf = true;
+  opts.allow_non_string_keys = true;
+  opts.pretty_formatting = true;
+  opts.sort_keys = true;
+  *os << json::serialize(dyn, opts);
 }
 
 //////////////////////////////////////////////////////////////////////

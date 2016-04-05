@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 #include <folly/Memory.h>
 #include <folly/Optional.h>
 #include <folly/String.h>
-#include <folly/experimental/Singleton.h>
+#include <folly/Singleton.h>
 #include <folly/json.h>
 
 namespace folly {
@@ -59,10 +59,10 @@ Optional<SchemaError> makeError(Args&&... args) {
 struct ValidationContext;
 
 struct IValidator {
-  virtual ~IValidator() {}
+  virtual ~IValidator() = default;
 
  private:
-  friend class ValidationContext;
+  friend struct ValidationContext;
 
   virtual Optional<SchemaError> validate(ValidationContext&,
                                          const dynamic& value) const = 0;
@@ -102,7 +102,7 @@ struct SchemaValidatorContext final {
  * Root validator for a schema.
  */
 struct SchemaValidator final : IValidator, public Validator {
-  SchemaValidator() {}
+  SchemaValidator() = default;
   void loadSchema(SchemaValidatorContext& context, const dynamic& schema);
 
   Optional<SchemaError> validate(ValidationContext&,
@@ -164,21 +164,21 @@ struct ComparisonValidator final : IValidator {
     if (type_ == Type::MIN) {
       if (exclusive_) {
         if (v <= s) {
-          return makeError("greater than", schema_, value);
+          return makeError("greater than ", schema_, value);
         }
       } else {
         if (v < s) {
-          return makeError("greater than or equal to", schema_, value);
+          return makeError("greater than or equal to ", schema_, value);
         }
       }
     } else if (type_ == Type::MAX) {
       if (exclusive_) {
         if (v >= s) {
-          return makeError("less than", schema_, value);
+          return makeError("less than ", schema_, value);
         }
       } else {
         if (v > s) {
-          return makeError("less than or equal to", schema_, value);
+          return makeError("less than or equal to ", schema_, value);
         }
       }
     }
@@ -351,9 +351,8 @@ struct RequiredValidator final : IValidator {
                                  const dynamic& value) const override {
     if (value.isObject()) {
       for (const auto& prop : properties_) {
-        auto* p = value.get_ptr(prop);
         if (!value.get_ptr(prop)) {
-          return makeError("to have property", prop, value);
+          return makeError("property ", prop, value);
         }
       }
     }
@@ -382,8 +381,8 @@ struct PropertiesValidator final : IValidator {
       for (const auto& pair : patternProperties->items()) {
         if (pair.first.isString()) {
           patternPropertyValidators_.emplace_back(
-              make_pair(boost::regex(pair.first.getString().toStdString()),
-                        SchemaValidator::make(context, pair.second)));
+              boost::regex(pair.first.getString().toStdString()),
+              SchemaValidator::make(context, pair.second));
         }
       }
     }
@@ -467,9 +466,8 @@ struct DependencyValidator final : IValidator {
         propertyDep_.emplace_back(std::move(p));
       }
       if (pair.second.isObject()) {
-        schemaDep_.emplace_back(
-            make_pair(pair.first.getString(),
-                      SchemaValidator::make(context, pair.second)));
+        schemaDep_.emplace_back(pair.first.getString(),
+                                SchemaValidator::make(context, pair.second));
       }
     }
   }
@@ -483,7 +481,7 @@ struct DependencyValidator final : IValidator {
       if (value.count(pair.first)) {
         for (const auto& prop : pair.second) {
           if (!value.count(prop)) {
-            return makeError("property", prop, value);
+            return makeError("property ", prop, value);
           }
         }
       }
@@ -1012,7 +1010,7 @@ folly::Singleton<Validator> schemaValidator([]() {
 });
 }
 
-Validator::~Validator() {}
+Validator::~Validator() = default;
 
 std::unique_ptr<Validator> makeValidator(const dynamic& schema) {
   auto v = make_unique<SchemaValidator>();

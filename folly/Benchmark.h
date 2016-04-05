@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_BENCHMARK_H_
-#define FOLLY_BENCHMARK_H_
+#pragma once
 
 #include <folly/Portability.h>
 #include <folly/Preprocessor.h> // for FB_ANONYMOUS_VARIABLE
+#include <folly/ScopeGuard.h>
+#include <folly/portability/Time.h>
+
 #include <cassert>
 #include <ctime>
 #include <boost/function_types/function_arity.hpp>
@@ -26,6 +28,7 @@
 #include <glog/logging.h>
 #include <gflags/gflags.h>
 #include <limits>
+#include <type_traits>
 
 DECLARE_bool(benchmark);
 
@@ -149,6 +152,13 @@ struct BenchmarkSuspender {
     CHECK_EQ(0, clock_gettime(detail::DEFAULT_CLOCK_ID, &start));
   }
 
+  template <class F>
+  auto dismissing(F f) -> typename std::result_of<F()>::type {
+    SCOPE_EXIT { rehire(); };
+    dismiss();
+    return f();
+  }
+
   /**
    * This is for use inside of if-conditions, used in BENCHMARK macros.
    * If-conditions bypass the explicit on operator bool.
@@ -248,11 +258,18 @@ void doNotOptimizeAway(T&& datum) {
 
 #pragma optimize("", on)
 
+#elif defined(__clang__)
+
+template <class T>
+__attribute__((__optnone__)) void doNotOptimizeAway(T&& /* datum */) {}
+
 #else
+
 template <class T>
 void doNotOptimizeAway(T&& datum) {
   asm volatile("" : "+r" (datum));
 }
+
 #endif
 
 } // namespace folly
@@ -518,5 +535,3 @@ void doNotOptimizeAway(T&& datum) {
   if (auto FB_ANONYMOUS_VARIABLE(BENCHMARK_SUSPEND) =   \
       ::folly::BenchmarkSuspender()) {}                 \
   else
-
-#endif // FOLLY_BENCHMARK_H_

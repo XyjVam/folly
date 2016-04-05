@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,14 +17,18 @@
 // @author Mark Rabkin (mrabkin@fb.com)
 // @author Andrei Alexandrescu (andrei.alexandrescu@fb.com)
 
-#ifndef FOLLY_RANGE_H_
-#define FOLLY_RANGE_H_
+#pragma once
 
-#include <folly/Portability.h>
 #include <folly/FBString.h>
+#include <folly/Portability.h>
+#include <folly/SpookyHashV2.h>
+#include <folly/portability/Constexpr.h>
+#include <folly/portability/String.h>
+
 #include <algorithm>
 #include <boost/operators.hpp>
 #include <climits>
+#include <cstddef>
 #include <cstring>
 #include <glog/logging.h>
 #include <iosfwd>
@@ -46,6 +50,8 @@
 #include <folly/CpuId.h>
 #include <folly/Traits.h>
 #include <folly/Likely.h>
+#include <folly/detail/RangeCommon.h>
+#include <folly/detail/RangeSse42.h>
 
 // Ignore shadowing warnings within this file, so includers can use -Wshadow.
 #pragma GCC diagnostic push
@@ -196,15 +202,14 @@ public:
   constexpr Range(Iter start, size_t size)
       : b_(start), e_(start + size) { }
 
-#if FOLLY_HAVE_CONSTEXPR_STRLEN
+# if !__clang__ || __CLANG_PREREQ(3, 7) // Clang 3.6 crashes on this line
+  /* implicit */ Range(std::nullptr_t) = delete;
+# endif
+
   template <class T = Iter, typename detail::IsCharPointer<T>::type = 0>
   constexpr /* implicit */ Range(Iter str)
-      : b_(str), e_(str + strlen(str)) {}
-#else
-  template <class T = Iter, typename detail::IsCharPointer<T>::type = 0>
-  /* implicit */ Range(Iter str)
-      : b_(str), e_(str + strlen(str)) {}
-#endif
+      : b_(str), e_(str + constexpr_strlen(str)) {}
+
   template <class T = Iter, typename detail::IsCharPointer<T>::const_type = 0>
   /* implicit */ Range(const std::string& str)
       : b_(str.data()), e_(b_ + str.size()) {}
@@ -353,7 +358,6 @@ public:
     return e_ - b_;
   }
   size_type walk_size() const {
-    assert(b_ <= e_);
     return std::distance(b_, e_);
   }
   bool empty() const { return b_ == e_; }
@@ -589,6 +593,22 @@ public:
   }
   bool endsWith(value_type c) const {
     return !empty() && back() == c;
+  }
+
+  /**
+   * Remove the items in [b, e), as long as this subrange is at the beginning
+   * or end of the Range.
+   *
+   * Required for boost::algorithm::trim()
+   */
+  void erase(Iter b, Iter e) {
+    if (b == b_) {
+      b_ = e;
+    } else if (e == e_) {
+      e_ = b;
+    } else {
+      throw std::out_of_range("index out of range");
+    }
   }
 
   /**
@@ -834,8 +854,17 @@ typedef Range<char*> MutableStringPiece;
 typedef Range<const unsigned char*> ByteRange;
 typedef Range<unsigned char*> MutableByteRange;
 
-std::ostream& operator<<(std::ostream& os, const StringPiece piece);
-std::ostream& operator<<(std::ostream& os, const MutableStringPiece piece);
+inline std::ostream& operator<<(std::ostream& os,
+                                const StringPiece piece) {
+  os.write(piece.start(), piece.size());
+  return os;
+}
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const MutableStringPiece piece) {
+  os.write(piece.start(), piece.size());
+  return os;
+}
 
 /**
  * Templated comparison operators
@@ -989,13 +1018,6 @@ size_t qfind(const Range<T>& haystack,
 
 namespace detail {
 
-size_t qfind_first_byte_of_nosse(const StringPiece haystack,
-                                 const StringPiece needles);
-
-#if FOLLY_HAVE_EMMINTRIN_H && __GNUC_PREREQ(4, 6)
-size_t qfind_first_byte_of_sse42(const StringPiece haystack,
-                                 const StringPiece needles);
-
 inline size_t qfind_first_byte_of(const StringPiece haystack,
                                   const StringPiece needles) {
   static auto const qfind_first_byte_of_fn =
@@ -1003,13 +1025,6 @@ inline size_t qfind_first_byte_of(const StringPiece haystack,
                            : qfind_first_byte_of_nosse;
   return qfind_first_byte_of_fn(haystack, needles);
 }
-
-#else
-inline size_t qfind_first_byte_of(const StringPiece haystack,
-                                  const StringPiece needles) {
-  return qfind_first_byte_of_nosse(haystack, needles);
-}
-#endif // FOLLY_HAVE_EMMINTRIN_H
 
 } // namespace detail
 
@@ -1044,9 +1059,6 @@ struct AsciiCaseInsensitive {
   }
 };
 
-extern const AsciiCaseSensitive asciiCaseSensitive;
-extern const AsciiCaseInsensitive asciiCaseInsensitive;
-
 template <class T>
 size_t qfind(const Range<T>& haystack,
              const typename Range<T>::value_type& needle) {
@@ -1073,14 +1085,12 @@ inline size_t qfind(const Range<const char*>& haystack, const char& needle) {
   return pos == nullptr ? std::string::npos : pos - haystack.data();
 }
 
-#if FOLLY_HAVE_MEMRCHR
 template <>
 inline size_t rfind(const Range<const char*>& haystack, const char& needle) {
   auto pos = static_cast<const char*>(
     ::memrchr(haystack.data(), needle, haystack.size()));
   return pos == nullptr ? std::string::npos : pos - haystack.data();
 }
-#endif
 
 // specialization for ByteRange
 template <>
@@ -1091,7 +1101,6 @@ inline size_t qfind(const Range<const unsigned char*>& haystack,
   return pos == nullptr ? std::string::npos : pos - haystack.data();
 }
 
-#if FOLLY_HAVE_MEMRCHR
 template <>
 inline size_t rfind(const Range<const unsigned char*>& haystack,
                     const unsigned char& needle) {
@@ -1099,12 +1108,11 @@ inline size_t rfind(const Range<const unsigned char*>& haystack,
     ::memrchr(haystack.data(), needle, haystack.size()));
   return pos == nullptr ? std::string::npos : pos - haystack.data();
 }
-#endif
 
 template <class T>
 size_t qfind_first_of(const Range<T>& haystack,
                       const Range<T>& needles) {
-  return qfind_first_of(haystack, needles, asciiCaseSensitive);
+  return qfind_first_of(haystack, needles, AsciiCaseSensitive());
 }
 
 // specialization for StringPiece
@@ -1121,10 +1129,20 @@ inline size_t qfind_first_of(const Range<const unsigned char*>& haystack,
   return detail::qfind_first_byte_of(StringPiece(haystack),
                                      StringPiece(needles));
 }
+
+template<class Key, class Enable>
+struct hasher;
+
+template <class T>
+struct hasher<folly::Range<T*>,
+              typename std::enable_if<std::is_pod<T>::value, void>::type> {
+  size_t operator()(folly::Range<T*> r) const {
+    return hash::SpookyHashV2::Hash64(r.begin(), r.size() * sizeof(T), 0);
+  }
+};
+
 }  // !namespace folly
 
 #pragma GCC diagnostic pop
 
 FOLLY_ASSUME_FBVECTOR_COMPATIBLE_1(folly::Range);
-
-#endif // FOLLY_RANGE_H_

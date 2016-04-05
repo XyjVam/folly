@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -280,7 +280,7 @@ TEST(SortedVectorTypes, GrowthPolicy) {
 
   std::list<CountCopyCtor> v;
   for (int i = 0; i < 20; ++i) {
-    v.push_back(CountCopyCtor(20 + i));
+    v.emplace_back(20 + i);
   }
   a.insert(v.begin(), v.end());
   check_invariant(a);

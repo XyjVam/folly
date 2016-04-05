@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ int dup2NoInt(int oldfd, int newfd) {
 int fdatasyncNoInt(int fd) {
 #if defined(__APPLE__)
   return wrapNoInt(fcntl, fd, F_FULLFSYNC);
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) || defined(_MSC_VER)
   return wrapNoInt(fsync, fd);
 #else
   return wrapNoInt(fdatasync, fd);

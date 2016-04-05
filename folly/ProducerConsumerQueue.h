@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@
 // @author Bo Hu (bhu@fb.com)
 // @author Jordan DeLong (delong.j@fb.com)
 
-#ifndef PRODUCER_CONSUMER_QUEUE_H_
-#define PRODUCER_CONSUMER_QUEUE_H_
+#pragma once
 
 #include <atomic>
 #include <cassert>
@@ -26,8 +25,6 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-#include <boost/noncopyable.hpp>
-#include <boost/type_traits.hpp>
 
 namespace folly {
 
@@ -36,8 +33,11 @@ namespace folly {
  * without locks.
  */
 template<class T>
-struct ProducerConsumerQueue : private boost::noncopyable {
+struct ProducerConsumerQueue {
   typedef T value_type;
+
+  ProducerConsumerQueue(const ProducerConsumerQueue&) = delete;
+  ProducerConsumerQueue& operator = (const ProducerConsumerQueue&) = delete;
 
   // size must be >= 2.
   //
@@ -60,7 +60,7 @@ struct ProducerConsumerQueue : private boost::noncopyable {
     // We need to destruct anything that may still exist in our queue.
     // (No real synchronization needed at destructor time: only one
     // thread can be doing this.)
-    if (!boost::has_trivial_destructor<T>::value) {
+    if (!std::is_trivially_destructible<T>::value) {
       size_t read = readIndex_;
       size_t end = writeIndex_;
       while (read != end) {
@@ -173,5 +173,3 @@ private:
 };
 
 }
-
-#endif

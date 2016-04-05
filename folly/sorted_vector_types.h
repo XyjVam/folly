@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,8 +57,7 @@
  *     std::vector<>, which requires it to be Assignable.)
  */
 
-#ifndef FOLLY_SORTED_VECTOR_TYPES_H_
-#define FOLLY_SORTED_VECTOR_TYPES_H_
+#pragma once
 
 #include <algorithm>
 #include <initializer_list>
@@ -654,5 +653,3 @@ inline void swap(sorted_vector_map<K,V,C,A,G>& a,
 //////////////////////////////////////////////////////////////////////
 
 }
-
-#endif

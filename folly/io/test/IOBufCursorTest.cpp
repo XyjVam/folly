@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,12 @@
 
 #include <folly/io/IOBuf.h>
 
-#include <gflags/gflags.h>
-#include <boost/random.hpp>
-#include <gtest/gtest.h>
-#include <folly/Benchmark.h>
 #include <folly/Format.h>
 #include <folly/Range.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/Cursor-defs.h>
 
-DECLARE_bool(benchmark);
+#include <gtest/gtest.h>
 
 using folly::ByteRange;
 using folly::format;
@@ -40,7 +36,7 @@ TEST(IOBuf, RWCursor) {
   unique_ptr<IOBuf> iobuf2(IOBuf::create(20));
   iobuf2->append(20);
 
-  IOBuf* iob2ptr = iobuf2.get();
+  iobuf2.get();
   iobuf1->prependChain(std::move(iobuf2));
 
   EXPECT_TRUE(iobuf1->isChained());
@@ -415,6 +411,47 @@ TEST(IOBuf, cloneAndInsert) {
   }
 }
 
+TEST(IOBuf, cloneWithEmptyBufAtStart) {
+  folly::IOBufEqual eq;
+  auto empty = IOBuf::create(0);
+  auto hel = IOBuf::create(3);
+  append(hel, "hel");
+  auto lo = IOBuf::create(2);
+  append(lo, "lo");
+
+  auto iobuf = empty->clone();
+  iobuf->prependChain(hel->clone());
+  iobuf->prependChain(lo->clone());
+  iobuf->prependChain(empty->clone());
+  iobuf->prependChain(hel->clone());
+  iobuf->prependChain(lo->clone());
+  iobuf->prependChain(empty->clone());
+  iobuf->prependChain(lo->clone());
+  iobuf->prependChain(hel->clone());
+  iobuf->prependChain(lo->clone());
+  iobuf->prependChain(lo->clone());
+
+  Cursor cursor(iobuf.get());
+  std::unique_ptr<IOBuf> cloned;
+  char data[3];
+  cursor.pull(&data, 3);
+  cursor.clone(cloned, 2);
+  EXPECT_EQ(1, cloned->countChainElements());
+  EXPECT_EQ(2, cloned->length());
+  EXPECT_TRUE(eq(lo, cloned));
+
+  cursor.pull(&data, 3);
+  EXPECT_EQ("hel", std::string(data, sizeof(data)));
+
+  cursor.skip(2);
+  cursor.clone(cloned, 2);
+  EXPECT_TRUE(eq(lo, cloned));
+
+  std::string hello = cursor.readFixedString(5);
+  cursor.clone(cloned, 2);
+  EXPECT_TRUE(eq(lo, cloned));
+}
+
 TEST(IOBuf, Appender) {
   std::unique_ptr<IOBuf> head(IOBuf::create(10));
   append(head, "hello");
@@ -577,6 +614,24 @@ TEST(IOBuf, CursorOperators) {
     c.skip(5);
     EXPECT_TRUE(c.isAtEnd());
   }
+
+  // Test canAdvance with a chain of items
+  {
+    auto chain = IOBuf::create(10);
+    chain->append(10);
+    chain->appendChain(chain->clone());
+    EXPECT_EQ(2, chain->countChainElements());
+    EXPECT_EQ(20, chain->computeChainDataLength());
+
+    Cursor c(chain.get());
+    for (size_t i = 0; i <= 20; ++i) {
+      EXPECT_TRUE(c.canAdvance(i));
+    }
+    EXPECT_FALSE(c.canAdvance(21));
+    c.skip(10);
+    EXPECT_TRUE(c.canAdvance(10));
+    EXPECT_FALSE(c.canAdvance(11));
+  }
 }
 
 TEST(IOBuf, StringOperations) {
@@ -642,6 +697,33 @@ TEST(IOBuf, StringOperations) {
     EXPECT_STREQ("hello", curs.readTerminatedString().c_str());
   }
 
+  // Test reading a null-terminated string from a chain that doesn't contain the
+  // terminator
+  {
+    std::unique_ptr<IOBuf> buf(IOBuf::create(8));
+    Appender app(buf.get(), 0);
+    app.push(reinterpret_cast<const uint8_t*>("hello"), 5);
+    std::unique_ptr<IOBuf> chain(IOBuf::create(8));
+    chain->prependChain(std::move(buf));
+
+    Cursor curs(chain.get());
+    EXPECT_THROW(curs.readTerminatedString(),
+                 std::out_of_range);
+  }
+
+  // Test reading a null-terminated string past the maximum length
+  {
+    std::unique_ptr<IOBuf> buf(IOBuf::create(8));
+    Appender app(buf.get(), 0);
+    app.push(reinterpret_cast<const uint8_t*>("hello\0"), 6);
+    std::unique_ptr<IOBuf> chain(IOBuf::create(8));
+    chain->prependChain(std::move(buf));
+
+    Cursor curs(chain.get());
+    EXPECT_THROW(curs.readTerminatedString('\0', 3),
+                 std::length_error);
+  }
+
   // Test reading a two fixed-length strings from a single buffer with an extra
   // uint8_t at the end
   {
@@ -692,92 +774,4 @@ TEST(IOBuf, StringOperations) {
     Cursor curs(chain.get());
     EXPECT_STREQ("hello", curs.readFixedString(5).c_str());
   }
-}
-
-int benchmark_size = 1000;
-unique_ptr<IOBuf> iobuf_benchmark;
-
-unique_ptr<IOBuf> iobuf_read_benchmark;
-
-template <class CursClass>
-void runBenchmark() {
-  CursClass c(iobuf_benchmark.get());
-
-  for(int i = 0; i < benchmark_size; i++) {
-    c.write((uint8_t)0);
-  }
-}
-
-BENCHMARK(rwPrivateCursorBenchmark, iters) {
-  while (iters--) {
-    runBenchmark<RWPrivateCursor>();
-  }
-}
-
-BENCHMARK(rwUnshareCursorBenchmark, iters) {
-  while (iters--) {
-    runBenchmark<RWUnshareCursor>();
-  }
-}
-
-
-BENCHMARK(cursorBenchmark, iters) {
-  while (iters--) {
-    Cursor c(iobuf_read_benchmark.get());
-    for(int i = 0; i < benchmark_size ; i++) {
-      c.read<uint8_t>();
-    }
-  }
-}
-
-BENCHMARK(skipBenchmark, iters) {
-  uint8_t buf;
-  while (iters--) {
-    Cursor c(iobuf_read_benchmark.get());
-    for(int i = 0; i < benchmark_size ; i++) {
-      c.peek();
-      c.skip(1);
-    }
-  }
-}
-
-// fbmake opt
-// _bin/folly/experimental/io/test/iobuf_cursor_test -benchmark
-//
-// Benchmark                               Iters   Total t    t/iter iter/sec
-// ---------------------------------------------------------------------------
-// rwPrivateCursorBenchmark               100000  142.9 ms  1.429 us  683.5 k
-// rwUnshareCursorBenchmark               100000  309.3 ms  3.093 us  315.7 k
-// cursorBenchmark                        100000  741.4 ms  7.414 us  131.7 k
-// skipBenchmark                          100000  738.9 ms  7.389 us  132.2 k
-//
-// uname -a:
-//
-// Linux dev2159.snc6.facebook.com 2.6.33-7_fbk15_104e4d0 #1 SMP
-// Tue Oct 19 22:40:30 PDT 2010 x86_64 x86_64 x86_64 GNU/Linux
-//
-// 72GB RAM, 2 CPUs (Intel(R) Xeon(R) CPU L5630  @ 2.13GHz)
-// hyperthreading disabled
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
-
-  auto ret = RUN_ALL_TESTS();
-
-  if (ret == 0 && FLAGS_benchmark) {
-    iobuf_benchmark = IOBuf::create(benchmark_size);
-    iobuf_benchmark->append(benchmark_size);
-
-    iobuf_read_benchmark = IOBuf::create(1);
-    for (int i = 0; i < benchmark_size; i++) {
-      unique_ptr<IOBuf> iobuf2(IOBuf::create(1));
-      iobuf2->append(1);
-      iobuf_read_benchmark->prependChain(std::move(iobuf2));
-    }
-
-    folly::runBenchmarks();
-  }
-
-  return ret;
 }

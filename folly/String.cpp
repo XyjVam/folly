@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <iterator>
 #include <cctype>
+#include <string.h>
 #include <glog/logging.h>
 
 namespace folly {
@@ -329,9 +330,20 @@ fbstring errnoStr(int err) {
 
   // https://developer.apple.com/library/mac/documentation/Darwin/Reference/ManPages/man3/strerror_r.3.html
   // http://www.kernel.org/doc/man-pages/online/pages/man3/strerror.3.html
-#if defined(__APPLE__) || defined(__FreeBSD__) ||\
-    defined(__CYGWIN__) || defined(__ANDROID__) ||\
-    ((_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && !_GNU_SOURCE)
+#if defined(_WIN32) && (defined(__MINGW32__) || defined(_MSC_VER))
+  // mingw64 has no strerror_r, but Windows has strerror_s, which C11 added
+  // as well. So maybe we should use this across all platforms (together
+  // with strerrorlen_s). Note strerror_r and _s have swapped args.
+  int r = strerror_s(buf, sizeof(buf), err);
+  if (r != 0) {
+    result = to<fbstring>(
+      "Unknown error ", err,
+      " (strerror_r failed with error ", errno, ")");
+  } else {
+    result.assign(buf);
+  }
+#elif defined(FOLLY_HAVE_XSI_STRERROR_R) || \
+  defined(__APPLE__) || defined(__ANDROID__)
   // Using XSI-compatible strerror_r
   int r = strerror_r(err, buf, sizeof(buf));
 
@@ -349,25 +361,6 @@ fbstring errnoStr(int err) {
 #endif
 
   return result;
-}
-
-StringPiece skipWhitespace(StringPiece sp) {
-  // Spaces other than ' ' characters are less common but should be
-  // checked.  This configuration where we loop on the ' '
-  // separately from oddspaces was empirically fastest.
-  auto oddspace = [] (char c) {
-    return c == '\n' || c == '\t' || c == '\r';
-  };
-
-loop:
-  for (; !sp.empty() && sp.front() == ' '; sp.pop_front()) {
-  }
-  if (!sp.empty() && oddspace(sp.front())) {
-    sp.pop_front();
-    goto loop;
-  }
-
-  return sp;
 }
 
 namespace {
@@ -554,6 +547,50 @@ size_t hexDumpLine(const void* ptr, size_t offset, size_t size,
 }
 
 } // namespace detail
+
+std::string stripLeftMargin(std::string s) {
+  std::vector<StringPiece> pieces;
+  split("\n", s, pieces);
+  auto piecer = range(pieces);
+
+  auto piece = (piecer.end() - 1);
+  auto needle = std::find_if(piece->begin(),
+                             piece->end(),
+                             [](char c) { return c != ' ' && c != '\t'; });
+  if (needle == piece->end()) {
+    (piecer.end() - 1)->clear();
+  }
+  piece = piecer.begin();
+  needle = std::find_if(piece->begin(),
+                        piece->end(),
+                        [](char c) { return c != ' ' && c != '\t'; });
+  if (needle == piece->end()) {
+    piecer.erase(piecer.begin(), piecer.begin() + 1);
+  }
+
+  const auto sentinel = std::numeric_limits<size_t>::max();
+  auto indent = sentinel;
+  size_t max_length = 0;
+  for (piece = piecer.begin(); piece != piecer.end(); piece++) {
+    needle = std::find_if(piece->begin(),
+                          piece->end(),
+                          [](char c) { return c != ' ' && c != '\t'; });
+    if (needle != piece->end()) {
+      indent = std::min<size_t>(indent, needle - piece->begin());
+    } else {
+      max_length = std::max<size_t>(piece->size(), max_length);
+    }
+  }
+  indent = indent == sentinel ? max_length : indent;
+  for (piece = piecer.begin(); piece != piecer.end(); piece++) {
+    if (piece->size() < indent) {
+      piece->clear();
+    } else {
+      piece->erase(piece->begin(), piece->begin() + indent);
+    }
+  }
+  return join("\n", piecer);
+}
 
 }   // namespace folly
 

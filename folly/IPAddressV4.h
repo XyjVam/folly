@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,6 +53,8 @@ typedef std::array<uint8_t, 4> ByteArray4;
  */
 class IPAddressV4 : boost::totally_ordered<IPAddressV4> {
  public:
+  static bool validate(StringPiece ip);
+
   // create an IPAddressV4 instance from a uint32_t (network byte order)
   static IPAddressV4 fromLong(uint32_t src);
   // same as above but host byte order
@@ -66,6 +68,13 @@ class IPAddressV4 : boost::totally_ordered<IPAddressV4> {
     IPAddressV4 addr;
     addr.setFromBinary(bytes);
     return addr;
+  }
+
+  /**
+   * Returns the address as a Range.
+   */
+  ByteRange toBinary() const {
+    return ByteRange((const unsigned char *) &addr_.inAddr_.s_addr, 4);
   }
 
   /**
@@ -97,6 +106,11 @@ class IPAddressV4 : boost::totally_ordered<IPAddressV4> {
 
   // Return the V6 mapped representation of the address.
   IPAddressV6 createIPv6() const;
+
+  /**
+   * Return a V6 address in the format of an 6To4 address.
+   */
+  IPAddressV6 getIPv6For6To4() const;
 
   // Return the long (network byte order) representation of the address.
   uint32_t toLong() const {
@@ -180,7 +194,7 @@ class IPAddressV4 : boost::totally_ordered<IPAddressV4> {
   ByteArray4 toByteArray() const {
     ByteArray4 ba{{0}};
     std::memcpy(ba.data(), bytes(), 4);
-    return std::move(ba);
+    return ba;
   }
 
   // @see IPAddress#toFullyQualified

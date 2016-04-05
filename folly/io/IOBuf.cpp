@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#ifndef __STDC_LIMIT_MACROS
 #define __STDC_LIMIT_MACROS
+#endif
 
 #include <folly/io/IOBuf.h>
 
@@ -112,7 +114,7 @@ struct IOBuf::HeapFullStorage {
 
   HeapStorage hs;
   SharedInfo shared;
-  MaxAlign align;
+  std::max_align_t align;
 };
 
 IOBuf::SharedInfo::SharedInfo()
@@ -143,9 +145,7 @@ void* IOBuf::operator new(size_t size) {
   return &(storage->buf);
 }
 
-void* IOBuf::operator new(size_t size, void* ptr) {
-  return ptr;
-}
+void* IOBuf::operator new(size_t /* size */, void* ptr) { return ptr; }
 
 void IOBuf::operator delete(void* ptr) {
   auto* storageAddr = static_cast<uint8_t*>(ptr) - offsetof(HeapStorage, buf);
@@ -186,7 +186,7 @@ void IOBuf::releaseStorage(HeapStorage* storage, uint16_t freeFlags) {
   }
 }
 
-void IOBuf::freeInternalBuf(void* buf, void* userData) {
+void IOBuf::freeInternalBuf(void* /* buf */, void* userData) {
   auto* storage = static_cast<HeapStorage*>(userData);
   releaseStorage(storage, kDataInUse);
 }
@@ -203,9 +203,12 @@ IOBuf::IOBuf(CreateOp, uint64_t capacity)
   data_ = buf_;
 }
 
-IOBuf::IOBuf(CopyBufferOp op, const void* buf, uint64_t size,
-             uint64_t headroom, uint64_t minTailroom)
-  : IOBuf(CREATE, headroom + size + minTailroom) {
+IOBuf::IOBuf(CopyBufferOp /* op */,
+             const void* buf,
+             uint64_t size,
+             uint64_t headroom,
+             uint64_t minTailroom)
+    : IOBuf(CREATE, headroom + size + minTailroom) {
   advance(headroom);
   memcpy(writableData(), buf, size);
   append(size);
@@ -336,6 +339,10 @@ IOBuf::IOBuf(IOBuf&& other) noexcept {
   *this = std::move(other);
 }
 
+IOBuf::IOBuf(const IOBuf& other) {
+  other.cloneInto(*this);
+}
+
 IOBuf::IOBuf(InternalConstructor,
              uintptr_t flagsAndSharedInfo,
              uint8_t* buf,
@@ -410,6 +417,13 @@ IOBuf& IOBuf::operator=(IOBuf&& other) noexcept {
   DCHECK_EQ(other.prev_, &other);
   DCHECK_EQ(other.next_, &other);
 
+  return *this;
+}
+
+IOBuf& IOBuf::operator=(const IOBuf& other) {
+  if (this != &other) {
+    *this = IOBuf(other);
+  }
   return *this;
 }
 
@@ -539,6 +553,19 @@ void IOBuf::unshareChained() {
 
   // We have to unshare.  Let coalesceSlow() do the work.
   coalesceSlow();
+}
+
+void IOBuf::makeManagedChained() {
+  assert(isChained());
+
+  IOBuf* current = this;
+  while (true) {
+    current->makeManagedOne();
+    current = current->next_;
+    if (current == this) {
+      break;
+    }
+  }
 }
 
 void IOBuf::coalesceSlow() {
@@ -698,7 +725,7 @@ void IOBuf::reserveSlow(uint64_t minHeadroom, uint64_t minTailroom) {
     return;
   }
 
-  size_t newAllocatedCapacity = goodExtBufferSize(newCapacity);
+  size_t newAllocatedCapacity = 0;
   uint8_t* newBuffer = nullptr;
   uint64_t newHeadroom = 0;
   uint64_t oldHeadroom = headroom();
@@ -708,8 +735,9 @@ void IOBuf::reserveSlow(uint64_t minHeadroom, uint64_t minTailroom) {
   SharedInfo* info = sharedInfo();
   if (info && (info->freeFn == nullptr) && length_ != 0 &&
       oldHeadroom >= minHeadroom) {
+    size_t headSlack = oldHeadroom - minHeadroom;
+    newAllocatedCapacity = goodExtBufferSize(newCapacity + headSlack);
     if (usingJEMalloc()) {
-      size_t headSlack = oldHeadroom - minHeadroom;
       // We assume that tailroom is more useful and more important than
       // headroom (not least because realloc / xallocx allow us to grow the
       // buffer at the tail, but not at the head)  So, if we have more headroom
@@ -722,7 +750,6 @@ void IOBuf::reserveSlow(uint64_t minHeadroom, uint64_t minTailroom) {
           if (xallocx(p, newAllocatedCapacity, 0, 0) == newAllocatedCapacity) {
             newBuffer = static_cast<uint8_t*>(p);
             newHeadroom = oldHeadroom;
-            newAllocatedCapacity = newAllocatedCapacity;
           }
           // if xallocx failed, do nothing, fall back to malloc/memcpy/free
         }
@@ -743,6 +770,7 @@ void IOBuf::reserveSlow(uint64_t minHeadroom, uint64_t minTailroom) {
   // None of the previous reallocation strategies worked (or we're using
   // an internal buffer).  malloc/copy/free.
   if (newBuffer == nullptr) {
+    newAllocatedCapacity = goodExtBufferSize(newCapacity);
     void* p = malloc(newAllocatedCapacity);
     if (UNLIKELY(p == nullptr)) {
       throw std::bad_alloc();

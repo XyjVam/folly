@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_HISTOGRAM_H_
-#define FOLLY_HISTOGRAM_H_
+#pragma once
 
 #include <cstddef>
 #include <limits>
@@ -141,6 +140,18 @@ class HistogramBuckets {
 
     return min_ + (idx * bucketSize_);
   }
+
+  /**
+   * Computes the total number of values stored across all buckets.
+   *
+   * Runs in O(numBuckets)
+   *
+   * @param countFn A function that takes a const BucketType&, and returns the
+   *                number of values in that bucket
+   * @return Returns the total number of values stored across all buckets
+   */
+  template <typename CountFn>
+  uint64_t computeTotalCount(CountFn countFromBucket) const;
 
   /**
    * Determine which bucket the specified percentile falls into.
@@ -376,6 +387,16 @@ class Histogram {
     return buckets_.getBucketMax(idx);
   }
 
+  /**
+   * Computes the total number of values stored across all buckets.
+   *
+   * Runs in O(numBuckets)
+   */
+  uint64_t computeTotalCount() const {
+    CountFromBucket countFn;
+    return buckets_.computeTotalCount(countFn);
+  }
+
   /*
    * Get the bucket that the specified percentile falls into
    *
@@ -416,7 +437,6 @@ class Histogram {
    */
   void toTSV(std::ostream& out, bool skipEmptyBuckets = true) const;
 
- private:
   struct CountFromBucket {
     uint64_t operator()(const Bucket& bucket) const {
       return bucket.count;
@@ -440,9 +460,8 @@ class Histogram {
     }
   };
 
+ private:
   detail::HistogramBuckets<ValueType, Bucket> buckets_;
 };
 
 } // folly
-
-#endif // FOLLY_HISTOGRAM_H_

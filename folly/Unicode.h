@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,7 @@
 
 // Some utility routines relating to unicode.
 
-#ifndef FOLLY_UNICODE_H_
-#define FOLLY_UNICODE_H_
+#pragma once
 
 #include <folly/FBString.h>
 
@@ -35,5 +34,3 @@ fbstring codePointToUtf8(char32_t cp);
 //////////////////////////////////////////////////////////////////////
 
 }
-
-#endif

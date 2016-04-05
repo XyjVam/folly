@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -142,6 +142,15 @@ void SocketAddress::setFromIpPort(const char* ip, uint16_t port) {
   setFromAddrInfo(results.info);
 }
 
+void SocketAddress::setFromIpAddrPort(const IPAddress& ipAddr, uint16_t port) {
+  if (external_) {
+    storage_.un.free();
+    external_ = false;
+  }
+  storage_.addr = ipAddr;
+  port_ = port;
+}
+
 void SocketAddress::setFromLocalPort(uint16_t port) {
   ScopedAddrInfo results(getAddrInfo(nullptr, port, AI_ADDRCONFIG));
   setFromLocalAddr(results.info);
@@ -171,32 +180,37 @@ void SocketAddress::setFromHostPort(const char* hostAndPort) {
   setFromAddrInfo(results.info);
 }
 
-void SocketAddress::setFromPath(const char* path, size_t len) {
+void SocketAddress::setFromPath(StringPiece path) {
+  // Before we touch storage_, check to see if the length is too big.
+  // Note that "storage_.un.addr->sun_path" may not be safe to evaluate here,
+  // but sizeof() just uses its type, and does't evaluate it.
+  if (path.size() > sizeof(storage_.un.addr->sun_path)) {
+    throw std::invalid_argument(
+        "socket path too large to fit into sockaddr_un");
+  }
+
   if (!external_) {
     storage_.un.init();
     external_ = true;
   }
 
+  size_t len = path.size();
   storage_.un.len = offsetof(struct sockaddr_un, sun_path) + len;
-  if (len > sizeof(storage_.un.addr->sun_path)) {
-    throw std::invalid_argument(
-      "socket path too large to fit into sockaddr_un");
-  } else if (len == sizeof(storage_.un.addr->sun_path)) {
-    // Note that there will be no terminating NUL in this case.
-    // We allow this since getsockname() and getpeername() may return
-    // Unix socket addresses with paths that fit exactly in sun_path with no
-    // terminating NUL.
-    memcpy(storage_.un.addr->sun_path, path, len);
-  } else {
-    memcpy(storage_.un.addr->sun_path, path, len + 1);
+  memcpy(storage_.un.addr->sun_path, path.data(), len);
+  // If there is room, put a terminating NUL byte in sun_path.  In general the
+  // path should be NUL terminated, although getsockname() and getpeername()
+  // may return Unix socket addresses with paths that fit exactly in sun_path
+  // with no terminating NUL.
+  if (len < sizeof(storage_.un.addr->sun_path)) {
+    storage_.un.addr->sun_path[len] = '\0';
   }
 }
 
-void SocketAddress::setFromPeerAddress(int socket) {
+void SocketAddress::setFromPeerAddress(SocketDesc socket) {
   setFromSocket(socket, getpeername);
 }
 
-void SocketAddress::setFromLocalAddress(int socket) {
+void SocketAddress::setFromLocalAddress(SocketDesc socket) {
   setFromSocket(socket, getsockname);
 }
 
@@ -220,12 +234,8 @@ void SocketAddress::setFromSockaddr(const struct sockaddr* address) {
       "SocketAddress::setFromSockaddr() called "
       "with unsupported address type");
   }
-  if (external_) {
-    storage_.un.free();
-    external_ = false;
-  }
-  storage_.addr = folly::IPAddress(address);
-  port_ = port;
+
+  setFromIpAddrPort(folly::IPAddress(address), port);
 }
 
 void SocketAddress::setFromSockaddr(const struct sockaddr* address,
@@ -600,8 +610,7 @@ void SocketAddress::setFromLocalAddr(const struct addrinfo* info) {
   setFromSockaddr(info->ai_addr, info->ai_addrlen);
 }
 
-void SocketAddress::setFromSocket(int socket,
-                                  int (*fn)(int, sockaddr*, socklen_t*)) {
+void SocketAddress::setFromSocket(SocketDesc socket, GetPeerNameFunc fn) {
   // Try to put the address into a local storage buffer.
   sockaddr_storage tmp_sock;
   socklen_t addrLen = sizeof(tmp_sock);

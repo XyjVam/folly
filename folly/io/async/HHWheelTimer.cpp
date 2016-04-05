@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements. See the NOTICE file
@@ -21,6 +21,7 @@
 #include <folly/io/async/HHWheelTimer.h>
 #include <folly/io/async/Request.h>
 
+#include <folly/Optional.h>
 #include <folly/ScopeGuard.h>
 
 #include <cassert>
@@ -54,6 +55,7 @@ void HHWheelTimer::Callback::setScheduled(HHWheelTimer* wheel,
   assert(wheel_ == nullptr);
   assert(expiration_ == milliseconds(0));
 
+  wheelGuard_ = DestructorGuard(wheel);
   wheel_ = wheel;
 
   // Only update the now_ time if we're not in a timeout expired callback
@@ -72,26 +74,40 @@ void HHWheelTimer::Callback::cancelTimeoutImpl() {
   hook_.unlink();
 
   wheel_ = nullptr;
+  wheelGuard_ = folly::none;
   expiration_ = milliseconds(0);
 }
 
-HHWheelTimer::HHWheelTimer(folly::EventBase* eventBase,
-                           std::chrono::milliseconds intervalMS)
-  : AsyncTimeout(eventBase)
-  , interval_(intervalMS)
-  , nextTick_(1)
-  , count_(0)
-  , catchupEveryN_(DEFAULT_CATCHUP_EVERY_N)
-  , expirationsSinceCatchup_(0)
-  , processingCallbacksGuard_(false)
-{
-}
+HHWheelTimer::HHWheelTimer(folly::TimeoutManager* timeoutMananger,
+                           std::chrono::milliseconds intervalMS,
+                           AsyncTimeout::InternalEnum internal,
+                           std::chrono::milliseconds defaultTimeoutMS)
+    : AsyncTimeout(timeoutMananger, internal),
+      interval_(intervalMS),
+      defaultTimeout_(defaultTimeoutMS),
+      nextTick_(1),
+      count_(0),
+      catchupEveryN_(DEFAULT_CATCHUP_EVERY_N),
+      expirationsSinceCatchup_(0),
+      processingCallbacksGuard_(false) {}
 
 HHWheelTimer::~HHWheelTimer() {
+  CHECK(count_ == 0);
 }
 
 void HHWheelTimer::destroy() {
-  assert(count_ == 0);
+  if (getDestructorGuardCount() == count_) {
+    // Every callback holds a DestructorGuard.  In this simple case,
+    // All timeouts should already be gone.
+    assert(count_ == 0);
+
+    // Clean them up in opt builds and move on
+    cancelAll();
+  }
+  // else, we are only marking pending destruction, but one or more
+  // HHWheelTimer::SharedPtr's (and possibly their timeouts) are still holding
+  // this HHWheelTimer.  We cannot assert that all timeouts have been cancelled,
+  // and will just have to wait for them all to complete on their own.
   DelayedDestruction::destroy();
 }
 
@@ -134,6 +150,12 @@ void HHWheelTimer::scheduleTimeout(Callback* callback,
   callback->setScheduled(this, timeout);
   scheduleTimeoutImpl(callback, timeout);
   count_++;
+}
+
+void HHWheelTimer::scheduleTimeout(Callback* callback) {
+  CHECK(std::chrono::milliseconds(-1) != defaultTimeout_)
+      << "Default timeout was not initialized";
+  scheduleTimeout(callback, defaultTimeout_);
 }
 
 bool HHWheelTimer::cascadeTimers(int bucket, int tick) {
@@ -204,30 +226,34 @@ void HHWheelTimer::timeoutExpired() noexcept {
 }
 
 size_t HHWheelTimer::cancelAll() {
-  decltype(buckets_) buckets;
-
-// Work around std::swap() bug in libc++
-//
-// http://llvm.org/bugs/show_bug.cgi?id=22106
-#if FOLLY_USE_LIBCPP
-  for (size_t i = 0; i < WHEEL_BUCKETS; ++i) {
-    for (size_t ii = 0; i < WHEEL_SIZE; ++ii) {
-      std::swap(buckets_[i][ii], buckets[i][ii]);
-    }
-  }
-#else
-  std::swap(buckets, buckets_);
-#endif
-
   size_t count = 0;
 
-  for (auto& tick : buckets) {
-    for (auto& bucket : tick) {
+  if (count_ != 0) {
+    const uint64_t numElements = WHEEL_BUCKETS * WHEEL_SIZE;
+    auto maxBuckets = std::min(numElements, count_);
+    auto buckets = folly::make_unique<CallbackList[]>(maxBuckets);
+    size_t countBuckets = 0;
+    for (auto& tick : buckets_) {
+      for (auto& bucket : tick) {
+        if (bucket.empty()) {
+          continue;
+        }
+        for (auto& cb : bucket) {
+          count++;
+        }
+        std::swap(bucket, buckets[countBuckets++]);
+        if (count >= count_) {
+          break;
+        }
+      }
+    }
+
+    for (size_t i = 0; i < countBuckets; ++i) {
+      auto& bucket = buckets[i];
       while (!bucket.empty()) {
         auto& cb = bucket.front();
         cb.cancelTimeout();
         cb.callbackCanceled();
-        count++;
       }
     }
   }

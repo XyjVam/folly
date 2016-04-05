@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,16 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_EXPERIMENTAL_EVENTCOUNT_H_
-#define FOLLY_EXPERIMENTAL_EVENTCOUNT_H_
+#pragma once
 
 #include <unistd.h>
 #include <syscall.h>
 #include <linux/futex.h>
 #include <sys/time.h>
-#include <cassert>
 #include <climits>
 #include <atomic>
 #include <thread>
+#include <glog/logging.h>
 
 #include <folly/Bits.h>
 #include <folly/Likely.h>
@@ -172,7 +171,7 @@ inline void EventCount::cancelWait() noexcept {
   // #waiters gets to 0, the less likely it is that we'll do spurious wakeups
   // (and thus system calls).
   uint64_t prev = val_.fetch_add(kSubWaiter, std::memory_order_seq_cst);
-  assert((prev & kWaiterMask) != 0);
+  DCHECK_NE((prev & kWaiterMask), 0);
 }
 
 inline void EventCount::wait(Key key) noexcept {
@@ -184,7 +183,7 @@ inline void EventCount::wait(Key key) noexcept {
   // #waiters gets to 0, the less likely it is that we'll do spurious wakeups
   // (and thus system calls)
   uint64_t prev = val_.fetch_add(kSubWaiter, std::memory_order_seq_cst);
-  assert((prev & kWaiterMask) != 0);
+  DCHECK_NE((prev & kWaiterMask), 0);
 }
 
 template <class Condition>
@@ -210,5 +209,3 @@ void EventCount::await(Condition condition) {
 }
 
 }  // namespace folly
-
-#endif /* FOLLY_EXPERIMENTAL_EVENTCOUNT_H_ */

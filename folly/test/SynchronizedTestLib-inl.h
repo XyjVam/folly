@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef FOLLY_TEST_SYNCHRONIZEDTESTLIB_INL_H
-#define FOLLY_TEST_SYNCHRONIZEDTESTLIB_INL_H
+#pragma once
 
 #include <gtest/gtest.h>
 
@@ -188,12 +187,12 @@ template <class Mutex> void testDualLockingWithConst() {
 
       if (i & 1) {
         SYNCHRONIZED_DUAL (v, pv, m, pm) {
-          size_t s = m.size();
+          (void)m.size();
           v.push_back(i);
         }
       } else {
         SYNCHRONIZED_DUAL (m, pm, v, pv) {
-          size_t s = m.size();
+          (void)m.size();
           v.push_back(i);
         }
       }
@@ -339,5 +338,17 @@ template <class Mutex> void testConstCopy() {
   EXPECT_EQ(result, input);
 }
 
+struct NotCopiableNotMovable {
+  NotCopiableNotMovable(int, const char*) {}
+  NotCopiableNotMovable(const NotCopiableNotMovable&) = delete;
+  NotCopiableNotMovable& operator=(const NotCopiableNotMovable&) = delete;
+  NotCopiableNotMovable(NotCopiableNotMovable&&) = delete;
+  NotCopiableNotMovable& operator=(NotCopiableNotMovable&&) = delete;
+};
 
-#endif  /* FOLLY_TEST_SYNCHRONIZEDTESTLIB_INL_H */
+template <class Mutex> void testInPlaceConstruction() {
+  // This won't compile without construct_in_place
+  folly::Synchronized<NotCopiableNotMovable> a(
+    folly::construct_in_place, 5, "a"
+  );
+}

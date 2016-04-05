@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,14 +27,14 @@
 
 #include <folly/Traits.h>
 #include <folly/detail/CacheLocality.h>
-#include <folly/detail/Futex.h>
+#include <folly/detail/TurnSequencer.h>
 
 namespace folly {
 
 namespace detail {
 
 template<typename T, template<typename> class Atom>
-class SingleElementQueue;
+struct SingleElementQueue;
 
 template <typename T> class MPMCPipelineStageImpl;
 
@@ -107,14 +107,21 @@ class MPMCQueue : boost::noncopyable {
 
   explicit MPMCQueue(size_t queueCapacity)
     : capacity_(queueCapacity)
-    , slots_(new detail::SingleElementQueue<T,Atom>[queueCapacity +
-                                                    2 * kSlotPadding])
-    , stride_(computeStride(queueCapacity))
     , pushTicket_(0)
     , popTicket_(0)
     , pushSpinCutoff_(0)
     , popSpinCutoff_(0)
   {
+    if (queueCapacity == 0)
+      throw std::invalid_argument(
+        "MPMCQueue with explicit capacity 0 is impossible"
+      );
+
+    // would sigfpe if capacity is 0
+    stride_ = computeStride(queueCapacity);
+    slots_ = new detail::SingleElementQueue<T,Atom>[queueCapacity +
+                                                    2 * kSlotPadding];
+
     // ideally this would be a static assert, but g++ doesn't allow it
     assert(alignof(MPMCQueue<T,Atom>)
            >= detail::CacheLocality::kFalseSharingRange);
@@ -270,6 +277,21 @@ class MPMCQueue : boost::noncopyable {
     uint64_t ticket;
     if (tryObtainReadyPushTicket(ticket)) {
       // we have pre-validated that the ticket won't block
+      enqueueWithTicket(ticket, std::forward<Args>(args)...);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  template <class Clock, typename... Args>
+  bool tryWriteUntil(const std::chrono::time_point<Clock>& when,
+                     Args&&... args) noexcept {
+    uint64_t ticket;
+    if (tryObtainPromisedPushTicketUntil(ticket, when)) {
+      // we have pre-validated that the ticket won't block, or rather that
+      // it won't block longer than it takes another thread to dequeue an
+      // element from the slot it identifies.
       enqueueWithTicket(ticket, std::forward<Args>(args)...);
       return true;
     } else {
@@ -464,6 +486,28 @@ class MPMCQueue : boost::noncopyable {
     }
   }
 
+  /// Tries until when to obtain a push ticket for which
+  /// SingleElementQueue::enqueue  won't block.  Returns true on success, false
+  /// on failure.
+  /// ticket is filled on success AND failure.
+  template <class Clock>
+  bool tryObtainPromisedPushTicketUntil(
+      uint64_t& ticket, const std::chrono::time_point<Clock>& when) noexcept {
+    bool deadlineReached = false;
+    while (!deadlineReached) {
+      if (tryObtainPromisedPushTicket(ticket)) {
+        return true;
+      }
+      // ticket is a blocking ticket until the preceding ticket has been
+      // processed: wait until this ticket's turn arrives. We have not reserved
+      // this ticket so we will have to re-attempt to get a non-blocking ticket
+      // if we wake up before we time-out.
+      deadlineReached = !slots_[idx(ticket)].tryWaitForEnqueueTurnUntil(
+          turn(ticket), pushSpinCutoff_, (ticket % kAdaptationFreq) == 0, when);
+    }
+    return false;
+  }
+
   /// Tries to obtain a push ticket which can be satisfied if all
   /// in-progress pops complete.  This function does not block, but
   /// blocking may be required when using the returned ticket if some
@@ -475,6 +519,7 @@ class MPMCQueue : boost::noncopyable {
       auto numPops = popTicket_.load(std::memory_order_acquire); // B
       // n will be negative if pops are pending
       int64_t n = numPushes - numPops;
+      rv = numPushes;
       if (n >= static_cast<ssize_t>(capacity_)) {
         // Full, linearize at B.  We don't need to recheck the read we
         // performed at A, because if numPushes was stale at B then the
@@ -482,7 +527,6 @@ class MPMCQueue : boost::noncopyable {
         return false;
       }
       if (pushTicket_.compare_exchange_strong(numPushes, numPushes + 1)) {
-        rv = numPushes;
         return true;
       }
     }
@@ -557,207 +601,6 @@ class MPMCQueue : boost::noncopyable {
 
 namespace detail {
 
-/// A TurnSequencer allows threads to order their execution according to
-/// a monotonically increasing (with wraparound) "turn" value.  The two
-/// operations provided are to wait for turn T, and to move to the next
-/// turn.  Every thread that is waiting for T must have arrived before
-/// that turn is marked completed (for MPMCQueue only one thread waits
-/// for any particular turn, so this is trivially true).
-///
-/// TurnSequencer's state_ holds 26 bits of the current turn (shifted
-/// left by 6), along with a 6 bit saturating value that records the
-/// maximum waiter minus the current turn.  Wraparound of the turn space
-/// is expected and handled.  This allows us to atomically adjust the
-/// number of outstanding waiters when we perform a FUTEX_WAKE operation.
-/// Compare this strategy to sem_t's separate num_waiters field, which
-/// isn't decremented until after the waiting thread gets scheduled,
-/// during which time more enqueues might have occurred and made pointless
-/// FUTEX_WAKE calls.
-///
-/// TurnSequencer uses futex() directly.  It is optimized for the
-/// case that the highest awaited turn is 32 or less higher than the
-/// current turn.  We use the FUTEX_WAIT_BITSET variant, which lets
-/// us embed 32 separate wakeup channels in a single futex.  See
-/// http://locklessinc.com/articles/futex_cheat_sheet for a description.
-///
-/// We only need to keep exact track of the delta between the current
-/// turn and the maximum waiter for the 32 turns that follow the current
-/// one, because waiters at turn t+32 will be awoken at turn t.  At that
-/// point they can then adjust the delta using the higher base.  Since we
-/// need to encode waiter deltas of 0 to 32 inclusive, we use 6 bits.
-/// We actually store waiter deltas up to 63, since that might reduce
-/// the number of CAS operations a tiny bit.
-///
-/// To avoid some futex() calls entirely, TurnSequencer uses an adaptive
-/// spin cutoff before waiting.  The overheads (and convergence rate)
-/// of separately tracking the spin cutoff for each TurnSequencer would
-/// be prohibitive, so the actual storage is passed in as a parameter and
-/// updated atomically.  This also lets the caller use different adaptive
-/// cutoffs for different operations (read versus write, for example).
-/// To avoid contention, the spin cutoff is only updated when requested
-/// by the caller.
-template <template<typename> class Atom>
-struct TurnSequencer {
-  explicit TurnSequencer(const uint32_t firstTurn = 0) noexcept
-      : state_(encode(firstTurn << kTurnShift, 0))
-  {}
-
-  /// Returns true iff a call to waitForTurn(turn, ...) won't block
-  bool isTurn(const uint32_t turn) const noexcept {
-    auto state = state_.load(std::memory_order_acquire);
-    return decodeCurrentSturn(state) == (turn << kTurnShift);
-  }
-
-  // Internally we always work with shifted turn values, which makes the
-  // truncation and wraparound work correctly.  This leaves us bits at
-  // the bottom to store the number of waiters.  We call shifted turns
-  // "sturns" inside this class.
-
-  /// Blocks the current thread until turn has arrived.  If
-  /// updateSpinCutoff is true then this will spin for up to kMaxSpins tries
-  /// before blocking and will adjust spinCutoff based on the results,
-  /// otherwise it will spin for at most spinCutoff spins.
-  void waitForTurn(const uint32_t turn,
-                   Atom<uint32_t>& spinCutoff,
-                   const bool updateSpinCutoff) noexcept {
-    uint32_t prevThresh = spinCutoff.load(std::memory_order_relaxed);
-    const uint32_t effectiveSpinCutoff =
-        updateSpinCutoff || prevThresh == 0 ? kMaxSpins : prevThresh;
-
-    uint32_t tries;
-    const uint32_t sturn = turn << kTurnShift;
-    for (tries = 0; ; ++tries) {
-      uint32_t state = state_.load(std::memory_order_acquire);
-      uint32_t current_sturn = decodeCurrentSturn(state);
-      if (current_sturn == sturn) {
-        break;
-      }
-
-      // wrap-safe version of assert(current_sturn < sturn)
-      assert(sturn - current_sturn < std::numeric_limits<uint32_t>::max() / 2);
-
-      // the first effectSpinCutoff tries are spins, after that we will
-      // record ourself as a waiter and block with futexWait
-      if (tries < effectiveSpinCutoff) {
-        asm volatile ("pause");
-        continue;
-      }
-
-      uint32_t current_max_waiter_delta = decodeMaxWaitersDelta(state);
-      uint32_t our_waiter_delta = (sturn - current_sturn) >> kTurnShift;
-      uint32_t new_state;
-      if (our_waiter_delta <= current_max_waiter_delta) {
-        // state already records us as waiters, probably because this
-        // isn't our first time around this loop
-        new_state = state;
-      } else {
-        new_state = encode(current_sturn, our_waiter_delta);
-        if (state != new_state &&
-            !state_.compare_exchange_strong(state, new_state)) {
-          continue;
-        }
-      }
-      state_.futexWait(new_state, futexChannel(turn));
-    }
-
-    if (updateSpinCutoff || prevThresh == 0) {
-      // if we hit kMaxSpins then spinning was pointless, so the right
-      // spinCutoff is kMinSpins
-      uint32_t target;
-      if (tries >= kMaxSpins) {
-        target = kMinSpins;
-      } else {
-        // to account for variations, we allow ourself to spin 2*N when
-        // we think that N is actually required in order to succeed
-        target = std::min<uint32_t>(kMaxSpins,
-                                    std::max<uint32_t>(kMinSpins, tries * 2));
-      }
-
-      if (prevThresh == 0) {
-        // bootstrap
-        spinCutoff.store(target);
-      } else {
-        // try once, keep moving if CAS fails.  Exponential moving average
-        // with alpha of 7/8
-        // Be careful that the quantity we add to prevThresh is signed.
-        spinCutoff.compare_exchange_weak(
-            prevThresh, prevThresh + int(target - prevThresh) / 8);
-      }
-    }
-  }
-
-  /// Unblocks a thread running waitForTurn(turn + 1)
-  void completeTurn(const uint32_t turn) noexcept {
-    uint32_t state = state_.load(std::memory_order_acquire);
-    while (true) {
-      assert(state == encode(turn << kTurnShift, decodeMaxWaitersDelta(state)));
-      uint32_t max_waiter_delta = decodeMaxWaitersDelta(state);
-      uint32_t new_state = encode(
-              (turn + 1) << kTurnShift,
-              max_waiter_delta == 0 ? 0 : max_waiter_delta - 1);
-      if (state_.compare_exchange_strong(state, new_state)) {
-        if (max_waiter_delta != 0) {
-          state_.futexWake(std::numeric_limits<int>::max(),
-                           futexChannel(turn + 1));
-        }
-        break;
-      }
-      // failing compare_exchange_strong updates first arg to the value
-      // that caused the failure, so no need to reread state_
-    }
-  }
-
-  /// Returns the least-most significant byte of the current uncompleted
-  /// turn.  The full 32 bit turn cannot be recovered.
-  uint8_t uncompletedTurnLSB() const noexcept {
-    return state_.load(std::memory_order_acquire) >> kTurnShift;
-  }
-
- private:
-  enum : uint32_t {
-    /// kTurnShift counts the bits that are stolen to record the delta
-    /// between the current turn and the maximum waiter. It needs to be big
-    /// enough to record wait deltas of 0 to 32 inclusive.  Waiters more
-    /// than 32 in the future will be woken up 32*n turns early (since
-    /// their BITSET will hit) and will adjust the waiter count again.
-    /// We go a bit beyond and let the waiter count go up to 63, which
-    /// is free and might save us a few CAS
-    kTurnShift = 6,
-    kWaitersMask = (1 << kTurnShift) - 1,
-
-    /// The minimum spin count that we will adaptively select
-    kMinSpins = 20,
-
-    /// The maximum spin count that we will adaptively select, and the
-    /// spin count that will be used when probing to get a new data point
-    /// for the adaptation
-    kMaxSpins = 2000,
-  };
-
-  /// This holds both the current turn, and the highest waiting turn,
-  /// stored as (current_turn << 6) | min(63, max(waited_turn - current_turn))
-  Futex<Atom> state_;
-
-  /// Returns the bitmask to pass futexWait or futexWake when communicating
-  /// about the specified turn
-  int futexChannel(uint32_t turn) const noexcept {
-    return 1 << (turn & 31);
-  }
-
-  uint32_t decodeCurrentSturn(uint32_t state) const noexcept {
-    return state & ~kWaitersMask;
-  }
-
-  uint32_t decodeMaxWaitersDelta(uint32_t state) const noexcept {
-    return state & kWaitersMask;
-  }
-
-  uint32_t encode(uint32_t currentSturn, uint32_t maxWaiterD) const noexcept {
-    return currentSturn | std::min(uint32_t{ kWaitersMask }, maxWaiterD);
-  }
-};
-
-
 /// SingleElementQueue implements a blocking queue that holds at most one
 /// item, and that requires its users to assign incrementing identifiers
 /// (turns) to each enqueue and dequeue operation.  Note that the turns
@@ -775,7 +618,7 @@ struct SingleElementQueue {
   /// enqueue using in-place noexcept construction
   template <typename ...Args,
             typename = typename std::enable_if<
-                std::is_nothrow_constructible<T,Args...>::value>::type>
+              std::is_nothrow_constructible<T,Args...>::value>::type>
   void enqueue(const uint32_t turn,
                Atom<uint32_t>& spinCutoff,
                const bool updateSpinCutoff,
@@ -791,24 +634,32 @@ struct SingleElementQueue {
   template <typename = typename std::enable_if<
                 (folly::IsRelocatable<T>::value &&
                  boost::has_nothrow_constructor<T>::value) ||
-                std::is_nothrow_constructible<T,T&&>::value>::type>
+                std::is_nothrow_constructible<T, T&&>::value>::type>
   void enqueue(const uint32_t turn,
                Atom<uint32_t>& spinCutoff,
                const bool updateSpinCutoff,
                T&& goner) noexcept {
-    if (std::is_nothrow_constructible<T,T&&>::value) {
-      // this is preferred
-      sequencer_.waitForTurn(turn * 2, spinCutoff, updateSpinCutoff);
-      new (&contents_) T(std::move(goner));
-      sequencer_.completeTurn(turn * 2);
-    } else {
-      // simulate nothrow move with relocation, followed by default
-      // construction to fill the gap we created
-      sequencer_.waitForTurn(turn * 2, spinCutoff, updateSpinCutoff);
-      memcpy(&contents_, &goner, sizeof(T));
-      sequencer_.completeTurn(turn * 2);
-      new (&goner) T();
-    }
+    enqueueImpl(
+        turn,
+        spinCutoff,
+        updateSpinCutoff,
+        std::move(goner),
+        typename std::conditional<std::is_nothrow_constructible<T,T&&>::value,
+                                  ImplByMove, ImplByRelocation>::type());
+  }
+
+  /// Waits until either:
+  /// 1: the dequeue turn preceding the given enqueue turn has arrived
+  /// 2: the given deadline has arrived
+  /// Case 1 returns true, case 2 returns false.
+  template <class Clock>
+  bool tryWaitForEnqueueTurnUntil(
+      const uint32_t turn,
+      Atom<uint32_t>& spinCutoff,
+      const bool updateSpinCutoff,
+      const std::chrono::time_point<Clock>& when) noexcept {
+    return sequencer_.tryWaitForTurn(
+        turn * 2, spinCutoff, updateSpinCutoff, &when);
   }
 
   bool mayEnqueue(const uint32_t turn) const noexcept {
@@ -819,24 +670,13 @@ struct SingleElementQueue {
                Atom<uint32_t>& spinCutoff,
                const bool updateSpinCutoff,
                T& elem) noexcept {
-    if (folly::IsRelocatable<T>::value) {
-      // this version is preferred, because we do as much work as possible
-      // before waiting
-      try {
-        elem.~T();
-      } catch (...) {
-        // unlikely, but if we don't complete our turn the queue will die
-      }
-      sequencer_.waitForTurn(turn * 2 + 1, spinCutoff, updateSpinCutoff);
-      memcpy(&elem, &contents_, sizeof(T));
-      sequencer_.completeTurn(turn * 2 + 1);
-    } else {
-      // use nothrow move assignment
-      sequencer_.waitForTurn(turn * 2 + 1, spinCutoff, updateSpinCutoff);
-      elem = std::move(*ptr());
-      destroyContents();
-      sequencer_.completeTurn(turn * 2 + 1);
-    }
+    dequeueImpl(turn,
+                spinCutoff,
+                updateSpinCutoff,
+                elem,
+                typename std::conditional<folly::IsRelocatable<T>::value,
+                                          ImplByRelocation,
+                                          ImplByMove>::type());
   }
 
   bool mayDequeue(const uint32_t turn) const noexcept {
@@ -863,6 +703,63 @@ struct SingleElementQueue {
 #ifndef NDEBUG
     memset(&contents_, 'Q', sizeof(T));
 #endif
+  }
+
+  /// Tag classes for dispatching to enqueue/dequeue implementation.
+  struct ImplByRelocation {};
+  struct ImplByMove {};
+
+  /// enqueue using nothrow move construction.
+  void enqueueImpl(const uint32_t turn,
+                   Atom<uint32_t>& spinCutoff,
+                   const bool updateSpinCutoff,
+                   T&& goner,
+                   ImplByMove) noexcept {
+    sequencer_.waitForTurn(turn * 2, spinCutoff, updateSpinCutoff);
+    new (&contents_) T(std::move(goner));
+    sequencer_.completeTurn(turn * 2);
+  }
+
+  /// enqueue by simulating nothrow move with relocation, followed by
+  /// default construction to a noexcept relocation.
+  void enqueueImpl(const uint32_t turn,
+                   Atom<uint32_t>& spinCutoff,
+                   const bool updateSpinCutoff,
+                   T&& goner,
+                   ImplByRelocation) noexcept {
+    sequencer_.waitForTurn(turn * 2, spinCutoff, updateSpinCutoff);
+    memcpy(&contents_, &goner, sizeof(T));
+    sequencer_.completeTurn(turn * 2);
+    new (&goner) T();
+  }
+
+  /// dequeue by destructing followed by relocation.  This version is preferred,
+  /// because as much work as possible can be done before waiting.
+  void dequeueImpl(uint32_t turn,
+                   Atom<uint32_t>& spinCutoff,
+                   const bool updateSpinCutoff,
+                   T& elem,
+                   ImplByRelocation) noexcept {
+    try {
+      elem.~T();
+    } catch (...) {
+      // unlikely, but if we don't complete our turn the queue will die
+    }
+    sequencer_.waitForTurn(turn * 2 + 1, spinCutoff, updateSpinCutoff);
+    memcpy(&elem, &contents_, sizeof(T));
+    sequencer_.completeTurn(turn * 2 + 1);
+  }
+
+  /// dequeue by nothrow move assignment.
+  void dequeueImpl(uint32_t turn,
+                   Atom<uint32_t>& spinCutoff,
+                   const bool updateSpinCutoff,
+                   T& elem,
+                   ImplByMove) noexcept {
+    sequencer_.waitForTurn(turn * 2 + 1, spinCutoff, updateSpinCutoff);
+    elem = std::move(*ptr());
+    destroyContents();
+    sequencer_.completeTurn(turn * 2 + 1);
   }
 };
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,6 +44,15 @@ void toAppend(IPAddressV4 addr, fbstring* result) {
   result->append(addr.str());
 }
 
+bool IPAddressV4::validate(StringPiece ip) {
+  constexpr size_t kStrMaxLen = INET_ADDRSTRLEN;
+  std::array<char, kStrMaxLen + 1> ip_cstr;
+  const size_t len = std::min(ip.size(), kStrMaxLen);
+  std::memcpy(ip_cstr.data(), ip.data(), len);
+  ip_cstr[len] = 0;
+  struct in_addr addr;
+  return 1 == inet_pton(AF_INET, ip_cstr.data(), &addr);
+}
 
 // public static
 IPAddressV4 IPAddressV4::fromLong(uint32_t src) {
@@ -111,10 +120,19 @@ void IPAddressV4::setFromBinary(ByteRange bytes) {
 
 // public
 IPAddressV6 IPAddressV4::createIPv6() const {
-  ByteArray16 ba{{0}};
+  ByteArray16 ba{};
   ba[10] = 0xff;
   ba[11] = 0xff;
   std::memcpy(&ba[12], bytes(), 4);
+  return IPAddressV6(ba);
+}
+
+// public
+IPAddressV6 IPAddressV4::getIPv6For6To4() const {
+  ByteArray16 ba{};
+  ba[0] = (uint8_t)((IPAddressV6::PREFIX_6TO4 & 0xFF00) >> 8);
+  ba[1] = (uint8_t)(IPAddressV6::PREFIX_6TO4 & 0x00FF);
+  std::memcpy(&ba[2], bytes(), 4);
   return IPAddressV6(ba);
 }
 

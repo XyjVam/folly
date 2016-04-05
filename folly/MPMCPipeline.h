@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -161,12 +161,15 @@ template <class In, class... Stages> class MPMCPipeline {
 #endif
         remainingUses_(amplification),
         value_(value * amplification) {
+      (void)owner; // -Wunused-parameter
     }
 
     uint64_t use(MPMCPipeline* owner) {
       CHECK_GT(remainingUses_--, 0);
 #ifndef NDEBUG
       CHECK(owner == owner_);
+#else
+      (void)owner; // -Wunused-parameter
 #endif
       return value_++;
     }
@@ -176,7 +179,7 @@ template <class In, class... Stages> class MPMCPipeline {
    * Default-construct pipeline. Useful to move-assign later,
    * just like MPMCQueue, see MPMCQueue.h for more details.
    */
-  MPMCPipeline() { }
+  MPMCPipeline() = default;
 
   /**
    * Construct a pipeline with N+1 queue sizes.

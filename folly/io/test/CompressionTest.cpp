@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -128,12 +128,14 @@ TEST(CompressionTestNeedsUncompressedLength, Simple) {
   EXPECT_TRUE(getCodec(CodecType::LZMA2)->needsUncompressedLength());
   EXPECT_FALSE(getCodec(CodecType::LZMA2_VARINT_SIZE)
     ->needsUncompressedLength());
+  EXPECT_TRUE(getCodec(CodecType::ZSTD_BETA)->needsUncompressedLength());
+  EXPECT_FALSE(getCodec(CodecType::GZIP)->needsUncompressedLength());
 }
 
 class CompressionTest
     : public testing::TestWithParam<std::tr1::tuple<int, CodecType>> {
   protected:
-   void SetUp() {
+   void SetUp() override {
      auto tup = GetParam();
      uncompressedLength_ = uint64_t(1) << std::tr1::get<0>(tup);
      codec_ = getCodec(std::tr1::get<1>(tup));
@@ -180,12 +182,14 @@ INSTANTIATE_TEST_CASE_P(
                                      CodecType::ZLIB,
                                      CodecType::LZ4_VARINT_SIZE,
                                      CodecType::LZMA2,
-                                     CodecType::LZMA2_VARINT_SIZE)));
+                                     CodecType::LZMA2_VARINT_SIZE,
+                                     CodecType::ZSTD_BETA,
+                                     CodecType::GZIP)));
 
 class CompressionVarintTest
     : public testing::TestWithParam<std::tr1::tuple<int, CodecType>> {
  protected:
-  void SetUp() {
+  void SetUp() override {
     auto tup = GetParam();
     uncompressedLength_ = uint64_t(1) << std::tr1::get<0>(tup);
     codec_ = getCodec(std::tr1::get<1>(tup));
@@ -237,9 +241,7 @@ INSTANTIATE_TEST_CASE_P(
 
 class CompressionCorruptionTest : public testing::TestWithParam<CodecType> {
  protected:
-  void SetUp() {
-    codec_ = getCodec(GetParam());
-  }
+  void SetUp() override { codec_ = getCodec(GetParam()); }
 
   void runSimpleTest(const DataHolder& dh);
 

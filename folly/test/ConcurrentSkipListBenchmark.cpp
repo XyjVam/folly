@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -384,13 +384,13 @@ class ConcurrentAccessData {
     FOR_EACH(lock, locks_) delete *lock;
   }
 
-  inline bool skipListFind(int idx, ValueType val) {
+  inline bool skipListFind(int /* idx */, ValueType val) {
     return skipList_.contains(val);
   }
-  inline void skipListInsert(int idx, ValueType val) {
+  inline void skipListInsert(int /* idx */, ValueType val) {
     skipList_.add(val);
   }
-  inline void skipListErase(int idx, ValueType val) {
+  inline void skipListErase(int /* idx */, ValueType val) {
     skipList_.remove(val);
   }
 

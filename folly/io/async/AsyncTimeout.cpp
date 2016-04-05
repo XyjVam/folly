@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements. See the NOTICE file
@@ -36,7 +36,7 @@ AsyncTimeout::AsyncTimeout(TimeoutManager* timeoutManager)
   timeoutManager_->attachTimeoutManager(
       this,
       TimeoutManager::InternalEnum::NORMAL);
-  RequestContext::getStaticContext();
+  RequestContext::saveContext();
 }
 
 AsyncTimeout::AsyncTimeout(EventBase* eventBase)
@@ -49,7 +49,7 @@ AsyncTimeout::AsyncTimeout(EventBase* eventBase)
       this,
       TimeoutManager::InternalEnum::NORMAL);
   }
-  RequestContext::getStaticContext();
+  RequestContext::saveContext();
 }
 
 AsyncTimeout::AsyncTimeout(TimeoutManager* timeoutManager,
@@ -59,7 +59,7 @@ AsyncTimeout::AsyncTimeout(TimeoutManager* timeoutManager,
   event_set(&event_, -1, EV_TIMEOUT, &AsyncTimeout::libeventCallback, this);
   event_.ev_base = nullptr;
   timeoutManager_->attachTimeoutManager(this, internal);
-  RequestContext::getStaticContext();
+  RequestContext::saveContext();
 }
 
 AsyncTimeout::AsyncTimeout(EventBase* eventBase, InternalEnum internal)
@@ -68,27 +68,27 @@ AsyncTimeout::AsyncTimeout(EventBase* eventBase, InternalEnum internal)
   event_set(&event_, -1, EV_TIMEOUT, &AsyncTimeout::libeventCallback, this);
   event_.ev_base = nullptr;
   timeoutManager_->attachTimeoutManager(this, internal);
-  RequestContext::getStaticContext();
+  RequestContext::saveContext();
 }
 
 AsyncTimeout::AsyncTimeout(): timeoutManager_(nullptr) {
   event_set(&event_, -1, EV_TIMEOUT, &AsyncTimeout::libeventCallback, this);
   event_.ev_base = nullptr;
-  RequestContext::getStaticContext();
+  RequestContext::saveContext();
 }
 
 AsyncTimeout::~AsyncTimeout() {
   cancelTimeout();
 }
 
-bool AsyncTimeout::scheduleTimeout(std::chrono::milliseconds timeout) {
+bool AsyncTimeout::scheduleTimeout(TimeoutManager::timeout_type timeout) {
   assert(timeoutManager_ != nullptr);
   context_ = RequestContext::saveContext();
   return timeoutManager_->scheduleTimeout(this, timeout);
 }
 
 bool AsyncTimeout::scheduleTimeout(uint32_t milliseconds) {
-  return scheduleTimeout(std::chrono::milliseconds(milliseconds));
+  return scheduleTimeout(TimeoutManager::timeout_type(milliseconds));
 }
 
 void AsyncTimeout::cancelTimeout() {
@@ -142,9 +142,12 @@ void AsyncTimeout::libeventCallback(int fd, short events, void* arg) {
   AsyncTimeout* timeout = reinterpret_cast<AsyncTimeout*>(arg);
   assert(fd == -1);
   assert(events == EV_TIMEOUT);
+  // prevent unused variable warnings
+  (void)fd;
+  (void)events;
 
   // double check that ev_flags gets reset when the timeout is not running
-  assert((timeout->event_.ev_flags & ~EVLIST_INTERNAL) == EVLIST_INIT);
+  assert((event_ref_flags(&timeout->event_) & ~EVLIST_INTERNAL) == EVLIST_INIT);
 
   // this can't possibly fire if timeout->eventBase_ is nullptr
   (void) timeout->timeoutManager_->bumpHandlingTime();

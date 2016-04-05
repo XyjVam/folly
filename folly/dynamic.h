@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@
  *   dynamic str = "string";
  *   dynamic map = dynamic::object;
  *   map[str] = twelve;
- *   map[str + "another_str"] = { "array", "of", 4, "elements" };
+ *   map[str + "another_str"] = dynamic::array("array", "of", 4, "elements");
  *   map.insert("null_element", nullptr);
  *   ++map[str];
  *   assert(map[str] == 13);
@@ -39,7 +39,7 @@
  *   // Building a complex object with a sub array inline:
  *   dynamic d = dynamic::object
  *     ("key", "value")
- *     ("key2", { "a", "array" })
+ *     ("key2", dynamic::array("a", "array"))
  *     ;
  *
  * Also see folly/json.h for the serialization and deserialization
@@ -60,8 +60,7 @@
  * @author Jordan DeLong <delong.j@fb.com>
  */
 
-#ifndef FOLLY_DYNAMIC_H_
-#define FOLLY_DYNAMIC_H_
+#pragma once
 
 #include <cstdint>
 #include <initializer_list>
@@ -118,24 +117,34 @@ public:
   struct const_item_iterator;
 
   /*
-   * Creation routines for making dynamic objects.  Objects are maps
-   * from key to value (so named due to json-related origins here).
+   * Creation routines for making dynamic objects and arrays.  Objects
+   * are maps from key to value (so named due to json-related origins
+   * here).
    *
    * Example:
    *
    *   // Make a fairly complex dynamic:
    *   dynamic d = dynamic::object("key", "value1")
-   *                              ("key2", { "value", "with", 4, "words" });
+   *                              ("key2", dynamic::array("value",
+   *                                                      "with",
+   *                                                      4,
+   *                                                      "words"));
    *
    *   // Build an object in a few steps:
    *   dynamic d = dynamic::object;
    *   d["key"] = 12;
-   *   d["something_else"] = { 1, 2, 3, nullptr };
+   *   d["something_else"] = dynamic::array(1, 2, 3, nullptr);
    */
 private:
+  struct PrivateTag {};
+  struct EmptyArrayTag {};
   struct ObjectMaker;
 
 public:
+  static void array(EmptyArrayTag);
+  template <class... Args>
+  static dynamic array(Args&& ...args);
+
   static ObjectMaker object();
   static ObjectMaker object(dynamic&&, dynamic&&);
   static ObjectMaker object(dynamic const&, dynamic&&);
@@ -152,9 +161,10 @@ public:
   /* implicit */ dynamic(fbstring&& val);
 
   /*
-   * This is part of the plumbing for object(), above.  Used to create
-   * a new object dynamic.
+   * This is part of the plumbing for array() and object(), above.
+   * Used to create a new array or object dynamic.
    */
+  /* implicit */ dynamic(void (*)(EmptyArrayTag));
   /* implicit */ dynamic(ObjectMaker (*)());
   /* implicit */ dynamic(ObjectMaker const&) = delete;
   /* implicit */ dynamic(ObjectMaker&&);
@@ -166,7 +176,15 @@ public:
    *
    *   dynamic v = { 1, 2, 3, "foo" };
    */
+  // TODO(ott, 10300209): Remove once all uses have been eradicated.
+
+  FOLLY_DEPRECATED(
+      "Initializer list syntax is deprecated (#10300209). Use dynamic::array.")
   /* implicit */ dynamic(std::initializer_list<dynamic> il);
+  dynamic(std::initializer_list<dynamic> il, PrivateTag);
+  FOLLY_DEPRECATED(
+      "Initializer list syntax is deprecated (#10300209). Use dynamic::array.")
+  dynamic& operator=(std::initializer_list<dynamic> il);
 
   /*
    * Conversion constructors from most of the other types.
@@ -283,14 +301,18 @@ public:
    *
    * These will throw a TypeError if the dynamic has a different type.
    */
-  const fbstring& getString() const;
-  double          getDouble() const;
-  int64_t         getInt() const;
-  bool            getBool() const;
-  fbstring& getString();
-  double&   getDouble();
-  int64_t&  getInt();
-  bool&     getBool();
+  const fbstring& getString() const&;
+  double          getDouble() const&;
+  int64_t         getInt() const&;
+  bool            getBool() const&;
+  fbstring& getString() &;
+  double&   getDouble() &;
+  int64_t&  getInt() &;
+  bool&     getBool() &;
+  fbstring getString() &&;
+  double   getDouble() &&;
+  int64_t  getInt() &&;
+  bool     getBool() &&;
 
   /*
    * It is occasionally useful to access a string's internal pointer
@@ -298,8 +320,10 @@ public:
    *
    * These will throw a TypeError if the dynamic is not a string.
    */
-  const char* data()  const;
-  const char* c_str() const;
+  const char* data()  const&;
+  const char* data()  && = delete;
+  const char* c_str() const&;
+  const char* c_str() && = delete;
   StringPiece stringPiece() const;
 
   /*
@@ -360,8 +384,9 @@ public:
    * will throw a TypeError.  Using an index that is out of range or
    * object-element that's not present throws std::out_of_range.
    */
-  dynamic const& at(dynamic const&) const;
-  dynamic&       at(dynamic const&);
+  dynamic const& at(dynamic const&) const&;
+  dynamic&       at(dynamic const&) &;
+  dynamic        at(dynamic const&) &&;
 
   /*
    * Like 'at', above, except it returns either a pointer to the contained
@@ -374,8 +399,9 @@ public:
    * Using these with dynamic objects that are not arrays or objects
    * will throw a TypeError.
    */
-  const dynamic* get_ptr(dynamic const&) const;
-  dynamic* get_ptr(dynamic const&);
+  const dynamic* get_ptr(dynamic const&) const&;
+  dynamic* get_ptr(dynamic const&) &;
+  dynamic* get_ptr(dynamic const&) && = delete;
 
   /*
    * This works for access to both objects and arrays.
@@ -389,8 +415,9 @@ public:
    *
    * These functions do not invalidate iterators.
    */
-  dynamic&       operator[](dynamic const&);
-  dynamic const& operator[](dynamic const&) const;
+  dynamic&       operator[](dynamic const&) &;
+  dynamic const& operator[](dynamic const&) const&;
+  dynamic        operator[](dynamic const&) &&;
 
   /*
    * Only defined for objects, throws TypeError otherwise.
@@ -401,8 +428,10 @@ public:
    * a reference to the existing value if present, the new value otherwise.
    */
   dynamic
-  getDefault(const dynamic& k, const dynamic& v = dynamic::object) const;
-  dynamic&& getDefault(const dynamic& k, dynamic&& v) const;
+  getDefault(const dynamic& k, const dynamic& v = dynamic::object) const&;
+  dynamic getDefault(const dynamic& k, dynamic&& v) const&;
+  dynamic getDefault(const dynamic& k, const dynamic& v = dynamic::object) &&;
+  dynamic getDefault(const dynamic& k, dynamic&& v) &&;
   template<class K, class V = dynamic>
   dynamic& setDefault(K&& k, V&& v = dynamic::object);
 
@@ -424,6 +453,23 @@ public:
    * Invalidates iterators.
    */
   template<class K, class V> void insert(K&&, V&& val);
+
+  /*
+   * These functions merge two folly dynamic objects.
+   * The "update" and "update_missing" functions extend the object by
+   *  inserting the key/value pairs of mergeObj into the current object.
+   *  For update, if key is duplicated between the two objects, it
+   *  will overwrite with the value of the object being inserted (mergeObj).
+   *  For "update_missing", it will prefer the value in the original object
+   *
+   * The "merge" function creates a new object consisting of the key/value
+   * pairs of both mergeObj1 and mergeObj2
+   * If the key is duplicated between the two objects,
+   *  it will prefer value in the second object (mergeObj2)
+   */
+  void update(const dynamic& mergeObj);
+  void update_missing(const dynamic& other);
+  static dynamic merge(const dynamic& mergeObj1, const dynamic& mergeObj2);
 
   /*
    * Erase an element from a dynamic object, by key.
@@ -494,8 +540,9 @@ private:
 
   template<class T> T const& get() const;
   template<class T> T&       get();
-  template<class T> T*       get_nothrow() noexcept;
-  template<class T> T const* get_nothrow() const noexcept;
+  template<class T> T*       get_nothrow() & noexcept;
+  template<class T> T const* get_nothrow() const& noexcept;
+  template<class T> T*       get_nothrow() && noexcept = delete;
   template<class T> T*       getAddress() noexcept;
   template<class T> T const* getAddress() const noexcept;
 
@@ -528,7 +575,7 @@ private:
      * incomplete type right now).  (Note that in contrast we know it
      * is ok to do this with fbvector because we own it.)
      */
-    typename std::aligned_storage<
+    std::aligned_storage<
       sizeof(std::unordered_map<int,int>),
       alignof(std::unordered_map<int,int>)
     >::type objectBuffer;
@@ -540,5 +587,3 @@ private:
 }
 
 #include <folly/dynamic-inl.h>
-
-#endif

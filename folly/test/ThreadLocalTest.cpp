@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #include <folly/ThreadLocal.h>
 
+#include <dlfcn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -24,18 +25,18 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <limits.h>
 #include <map>
 #include <mutex>
 #include <set>
 #include <thread>
 #include <unordered_map>
 
-#include <boost/thread/tss.hpp>
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <folly/Benchmark.h>
+#include <folly/Baton.h>
+#include <folly/experimental/io/FsUtil.h>
 
 using namespace folly;
 
@@ -107,14 +108,15 @@ TEST(ThreadLocalPtr, CreateOnThreadExit) {
   ThreadLocalPtr<int> tl;
 
   std::thread([&] {
-      tl.reset(new int(1), [&] (int* ptr, TLPDestructionMode mode) {
-        delete ptr;
-        // This test ensures Widgets allocated here are not leaked.
-        ++w.get()->val_;
-        ThreadLocal<Widget> wl;
-        ++wl.get()->val_;
-      });
-    }).join();
+    tl.reset(new int(1),
+             [&](int* ptr, TLPDestructionMode /* mode */) {
+               delete ptr;
+               // This test ensures Widgets allocated here are not leaked.
+               ++w.get()->val_;
+               ThreadLocal<Widget> wl;
+               ++wl.get()->val_;
+             });
+  }).join();
   EXPECT_EQ(2, Widget::totalVal_);
 }
 
@@ -538,75 +540,56 @@ TEST(ThreadLocal, Fork2) {
   }
 }
 
-// Simple reference implementation using pthread_get_specific
-template<typename T>
-class PThreadGetSpecific {
- public:
-  PThreadGetSpecific() : key_(0) {
-    pthread_key_create(&key_, OnThreadExit);
-  }
+TEST(ThreadLocal, SharedLibrary) {
+  auto exe = fs::executable_path();
+  auto lib = exe.parent_path() / "lib_thread_local_test.so";
+  auto handle = dlopen(lib.string().c_str(), RTLD_LAZY);
+  EXPECT_NE(nullptr, handle);
 
-  T* get() const {
-    return static_cast<T*>(pthread_getspecific(key_));
-  }
+  typedef void (*useA_t)();
+  dlerror();
+  useA_t useA = (useA_t) dlsym(handle, "useA");
 
-  void reset(T* t) {
-    delete get();
-    pthread_setspecific(key_, t);
-  }
-  static void OnThreadExit(void* obj) {
-    delete static_cast<T*>(obj);
-  }
- private:
-  pthread_key_t key_;
-};
+  const char *dlsym_error = dlerror();
+  EXPECT_EQ(nullptr, dlsym_error);
 
-DEFINE_int32(numThreads, 8, "Number simultaneous threads for benchmarks.");
+  useA();
 
-#define REG(var)                                                \
-  BENCHMARK(FB_CONCATENATE(BM_mt_, var), iters) {               \
-    const int itersPerThread = iters / FLAGS_numThreads;        \
-    std::vector<std::thread> threads;                           \
-    for (int i = 0; i < FLAGS_numThreads; ++i) {                \
-      threads.push_back(std::thread([&]() {                     \
-        var.reset(new int(0));                                  \
-        for (int i = 0; i < itersPerThread; ++i) {              \
-          ++(*var.get());                                       \
-        }                                                       \
-      }));                                                      \
-    }                                                           \
-    for (auto& t : threads) {                                   \
-      t.join();                                                 \
-    }                                                           \
-  }
+  folly::Baton<> b11, b12, b21, b22;
 
-ThreadLocalPtr<int> tlp;
-REG(tlp);
-PThreadGetSpecific<int> pthread_get_specific;
-REG(pthread_get_specific);
-boost::thread_specific_ptr<int> boost_tsp;
-REG(boost_tsp);
-BENCHMARK_DRAW_LINE();
+  std::thread t1([&]() {
+      useA();
+      b11.post();
+      b12.wait();
+    });
 
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
-  gflags::SetCommandLineOptionWithMode(
-    "bm_max_iters", "100000000", gflags::SET_FLAG_IF_DEFAULT
-  );
-  if (FLAGS_benchmark) {
-    folly::runBenchmarks();
-  }
-  return RUN_ALL_TESTS();
+  std::thread t2([&]() {
+      useA();
+      b21.post();
+      b22.wait();
+    });
+
+  b11.wait();
+  b21.wait();
+
+  dlclose(handle);
+
+  b12.post();
+  b22.post();
+
+  t1.join();
+  t2.join();
 }
 
-/*
-Ran with 24 threads on dual 12-core Xeon(R) X5650 @ 2.67GHz with 12-MB caches
+namespace folly { namespace threadlocal_detail {
+struct PthreadKeyUnregisterTester {
+  PthreadKeyUnregister p;
+  constexpr PthreadKeyUnregisterTester() = default;
+};
+}}
 
-Benchmark                               Iters   Total t    t/iter iter/sec
-------------------------------------------------------------------------------
-*       BM_mt_tlp                   100000000  39.88 ms  398.8 ps  2.335 G
- +5.91% BM_mt_pthread_get_specific  100000000  42.23 ms  422.3 ps  2.205 G
- + 295% BM_mt_boost_tsp             100000000  157.8 ms  1.578 ns  604.5 M
-------------------------------------------------------------------------------
-*/
+TEST(ThreadLocal, UnregisterClassHasConstExprCtor) {
+  folly::threadlocal_detail::PthreadKeyUnregisterTester x;
+  // yep!
+  SUCCEED();
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,6 +46,20 @@ void toAppend(IPAddressV6 addr, string* result) {
 }
 void toAppend(IPAddressV6 addr, fbstring* result) {
   result->append(addr.str());
+}
+
+bool IPAddressV6::validate(StringPiece ip) {
+  if (ip.size() > 0 && ip.front() == '[' && ip.back() == ']') {
+    ip = ip.subpiece(1, ip.size() - 2);
+  }
+
+  constexpr size_t kStrMaxLen = INET6_ADDRSTRLEN;
+  std::array<char, kStrMaxLen + 1> ip_cstr;
+  const size_t len = std::min(ip.size(), kStrMaxLen);
+  std::memcpy(ip_cstr.data(), ip.data(), len);
+  ip_cstr[len] = 0;
+  struct in6_addr addr;
+  return 1 == inet_pton(AF_INET6, ip_cstr.data(), &addr);
 }
 
 // public default constructor
@@ -338,7 +352,7 @@ string IPAddressV6::str() const {
         buffer, INET6_ADDRSTRLEN,
         nullptr, 0, NI_NUMERICHOST)) {
     string ip(buffer);
-    return std::move(ip);
+    return ip;
   } else {
     throw IPAddressFormatException("Invalid address with hex ",
                                    "'", detail::Bytes::toHex(bytes(), 16), "'");
@@ -374,8 +388,8 @@ const ByteArray16 IPAddressV6::fetchMask(size_t numBits) {
 // protected
 bool IPAddressV6::inBinarySubnet(const std::array<uint8_t, 2> addr,
                                  size_t numBits) const {
-  const unsigned char* subbytes = mask(numBits).bytes();
-  return (std::memcmp(addr.data(), subbytes, 2) == 0);
+  auto masked = mask(numBits);
+  return (std::memcmp(addr.data(), masked.bytes(), 2) == 0);
 }
 
 // static private

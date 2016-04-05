@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,10 @@
 
 #include <folly/Range.h>
 
+#include <folly/portability/Memory.h>
+
 #include <sys/mman.h>
 #include <array>
-#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <random>
@@ -29,17 +30,11 @@
 #include <type_traits>
 #include <vector>
 #include <boost/range/concepts.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <gtest/gtest.h>
 
-namespace folly { namespace detail {
-
-// declaration of functions in Range.cpp
-size_t qfind_first_byte_of_byteset(const StringPiece haystack,
-                                   const StringPiece needles);
-
-}}  // namespaces
-
 using namespace folly;
+using namespace folly::detail;
 using namespace std;
 
 static_assert(std::is_literal_type<StringPiece>::value, "");
@@ -298,7 +293,6 @@ TEST(StringPiece, InvalidRange) {
   EXPECT_THROW(a.subpiece(6), std::out_of_range);
 }
 
-#if FOLLY_HAVE_CONSTEXPR_STRLEN
 constexpr char helloArray[] = "hello";
 
 TEST(StringPiece, Constexpr) {
@@ -308,7 +302,6 @@ TEST(StringPiece, Constexpr) {
   constexpr StringPiece hello2(helloArray);
   EXPECT_EQ("hello", hello2);
 }
-#endif
 
 TEST(StringPiece, Prefix) {
   StringPiece a("hello");
@@ -428,6 +421,43 @@ TEST(StringPiece, SuffixEmpty) {
   EXPECT_EQ("", a);
   EXPECT_FALSE(a.removeSuffix('a'));
   EXPECT_EQ("", a);
+}
+
+TEST(StringPiece, erase) {
+  StringPiece a("hello");
+  auto b = a.begin();
+  auto e = b + 1;
+  a.erase(b, e);
+  EXPECT_EQ("ello", a);
+
+  e = a.end();
+  b = e - 1;
+  a.erase(b, e);
+  EXPECT_EQ("ell", a);
+
+  b = a.end() - 1;
+  e = a.end() - 1;
+  EXPECT_THROW(a.erase(b, e), std::out_of_range);
+
+  b = a.begin();
+  e = a.end();
+  a.erase(b, e);
+  EXPECT_EQ("", a);
+
+  a = "hello";
+  b = a.begin();
+  e = b + 2;
+  a.erase(b, e);
+  EXPECT_EQ("llo", a);
+
+  b = a.end() - 2;
+  e = a.end();
+  a.erase(b, e);
+  EXPECT_EQ("l", a);
+
+  a = "      hello  ";
+  boost::algorithm::trim(a);
+  EXPECT_EQ(a, "hello");
 }
 
 TEST(StringPiece, split_step_char_delimiter) {
@@ -948,18 +978,22 @@ const size_t kPageSize = 4096;
 void createProtectedBuf(StringPiece& contents, char** buf) {
   ASSERT_LE(contents.size(), kPageSize);
   const size_t kSuccess = 0;
-  if (kSuccess != posix_memalign((void**)buf, kPageSize, 4 * kPageSize)) {
+  char* pageAlignedBuf = (char*)aligned_malloc(2 * kPageSize, kPageSize);
+  if (pageAlignedBuf == nullptr) {
     ASSERT_FALSE(true);
   }
-  mprotect(*buf + kPageSize, kPageSize, PROT_NONE);
+  // Protect the page after the first full page-aligned region of the
+  // malloc'ed buffer
+  mprotect(pageAlignedBuf + kPageSize, kPageSize, PROT_NONE);
   size_t newBegin = kPageSize - contents.size();
-  memcpy(*buf + newBegin, contents.data(), contents.size());
-  contents.reset(*buf + newBegin, contents.size());
+  memcpy(pageAlignedBuf + newBegin, contents.data(), contents.size());
+  contents.reset(pageAlignedBuf + newBegin, contents.size());
+  *buf = pageAlignedBuf;
 }
 
 void freeProtectedBuf(char* buf) {
   mprotect(buf + kPageSize, kPageSize, PROT_READ | PROT_WRITE);
-  free(buf);
+  aligned_free(buf);
 }
 
 TYPED_TEST(NeedleFinderTest, NoSegFault) {

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,17 +17,26 @@
 #pragma once
 
 #include <fcntl.h>
+#include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <deque>
+#include <iterator>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+
+#include <folly/FileUtil.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventHandler.h>
+#include <folly/io/async/DelayedDestruction.h>
 #include <folly/io/async/Request.h>
 #include <folly/Likely.h>
 #include <folly/ScopeGuard.h>
 #include <folly/SpinLock.h>
 
 #include <glog/logging.h>
-#include <deque>
 
 #if __linux__ && !__ANDROID__
 #define FOLLY_HAVE_EVENTFD
@@ -60,7 +69,7 @@ class NotificationQueue {
   /**
    * A callback interface for consuming messages from the queue as they arrive.
    */
-  class Consumer : private EventHandler {
+  class Consumer : public DelayedDestruction, private EventHandler {
    public:
     enum : uint16_t { kDefaultMaxReadAtOnce = 10 };
 
@@ -69,7 +78,10 @@ class NotificationQueue {
         destroyedFlagPtr_(nullptr),
         maxReadAtOnce_(kDefaultMaxReadAtOnce) {}
 
-    virtual ~Consumer();
+    // create a consumer in-place, without the need to build new class
+    template <typename TCallback>
+    static std::unique_ptr<Consumer, DelayedDestruction::Destructor> make(
+        TCallback&& callback);
 
     /**
      * messageAvailable() will be invoked whenever a new
@@ -120,7 +132,7 @@ class NotificationQueue {
      * @returns true if the queue was drained, false otherwise. In practice,
      * this will only fail if someone else is already draining the queue.
      */
-    bool consumeUntilDrained() noexcept;
+    bool consumeUntilDrained(size_t* numConsumed = nullptr) noexcept;
 
     /**
      * Get the NotificationQueue that this consumer is currently consuming
@@ -152,7 +164,13 @@ class NotificationQueue {
       return base_;
     }
 
-    virtual void handlerReady(uint16_t events) noexcept;
+    void handlerReady(uint16_t events) noexcept override;
+
+   protected:
+
+    void destroy() override;
+
+    virtual ~Consumer() {}
 
    private:
     /**
@@ -165,7 +183,7 @@ class NotificationQueue {
      *
      * (1) Well, maybe. See logic/comments around "wasEmpty" in implementation.
      */
-    void consumeMessages(bool isDrain) noexcept;
+    void consumeMessages(bool isDrain, size_t* numConsumed = nullptr) noexcept;
 
     void setActive(bool active, bool shouldLock = false) {
       if (!queue_) {
@@ -222,13 +240,13 @@ class NotificationQueue {
 #else
                              FdType fdType = FdType::PIPE)
 #endif
-    : eventfd_(-1),
-      pipeFds_{-1, -1},
-      advisoryMaxQueueSize_(maxSize),
-      pid_(getpid()),
-      queue_() {
+      : eventfd_(-1),
+        pipeFds_{-1, -1},
+        advisoryMaxQueueSize_(maxSize),
+        pid_(pid_t(getpid())),
+        queue_() {
 
-    RequestContext::getStaticContext();
+    RequestContext::saveContext();
 
 #ifdef FOLLY_HAVE_EVENTFD
     if (fdType == FdType::EVENTFD) {
@@ -402,7 +420,7 @@ class NotificationQueue {
     return true;
   }
 
-  int size() {
+  size_t size() {
     folly::SpinLockGuard g(spinlock_);
     return queue_.size();
   }
@@ -420,9 +438,7 @@ class NotificationQueue {
    * check ensures that we catch the problem in the misbehaving child process
    * code, and crash before signalling the parent process.
    */
-  void checkPid() const {
-    CHECK_EQ(pid_, getpid());
-  }
+  void checkPid() const { CHECK_EQ(pid_, pid_t(getpid())); }
 
  private:
   // Forbidden copy constructor and assignment operator
@@ -485,16 +501,16 @@ class NotificationQueue {
     uint64_t value = 0;
     ssize_t rc = -1;
     if (eventfd_ >= 0) {
-      rc = ::read(eventfd_, &value, sizeof(value));
+      rc = readNoInt(eventfd_, &value, sizeof(value));
     } else {
       uint8_t value8;
-      rc = ::read(pipeFds_[0], &value8, sizeof(value8));
+      rc = readNoInt(pipeFds_[0], &value8, sizeof(value8));
       value = value8;
     }
     if (rc < 0) {
       // EAGAIN should pretty much be the only error we can ever get.
       // This means someone else already processed the only available message.
-      assert(errno == EAGAIN);
+      CHECK_EQ(errno, EAGAIN);
       return false;
     }
     assert(value == 1);
@@ -514,9 +530,7 @@ class NotificationQueue {
       if (numActiveConsumers_ < numConsumers_) {
         signal = true;
       }
-      queue_.push_back(
-        std::make_pair(std::move(message),
-                       RequestContext::saveContext()));
+      queue_.emplace_back(std::move(message), RequestContext::saveContext());
     }
     if (signal) {
       signalEvent();
@@ -536,7 +550,7 @@ class NotificationQueue {
       if (numActiveConsumers_ < numConsumers_) {
         signal = true;
       }
-      queue_.push_back(std::make_pair(message, RequestContext::saveContext()));
+      queue_.emplace_back(message, RequestContext::saveContext());
     }
     if (signal) {
       signalEvent();
@@ -554,7 +568,7 @@ class NotificationQueue {
       folly::SpinLockGuard g(spinlock_);
       checkDraining();
       while (first != last) {
-        queue_.push_back(std::make_pair(*first, RequestContext::saveContext()));
+        queue_.emplace_back(*first, RequestContext::saveContext());
         ++first;
         ++numAdded;
       }
@@ -579,7 +593,7 @@ class NotificationQueue {
 };
 
 template<typename MessageT>
-NotificationQueue<MessageT>::Consumer::~Consumer() {
+void NotificationQueue<MessageT>::Consumer::destroy() {
   // If we are in the middle of a call to handlerReady(), destroyedFlagPtr_
   // will be non-nullptr.  Mark the value that it points to, so that
   // handlerReady() will know the callback is destroyed, and that it cannot
@@ -587,21 +601,29 @@ NotificationQueue<MessageT>::Consumer::~Consumer() {
   if (destroyedFlagPtr_) {
     *destroyedFlagPtr_ = true;
   }
+  stopConsuming();
+  DelayedDestruction::destroy();
 }
 
 template<typename MessageT>
-void NotificationQueue<MessageT>::Consumer::handlerReady(uint16_t events)
+void NotificationQueue<MessageT>::Consumer::handlerReady(uint16_t /*events*/)
     noexcept {
   consumeMessages(false);
 }
 
 template<typename MessageT>
 void NotificationQueue<MessageT>::Consumer::consumeMessages(
-    bool isDrain) noexcept {
+    bool isDrain, size_t* numConsumed) noexcept {
+  DestructorGuard dg(this);
   uint32_t numProcessed = 0;
   bool firstRun = true;
   setActive(true);
   SCOPE_EXIT { setActive(false, /* shouldLock = */ true); };
+  SCOPE_EXIT {
+    if (numConsumed != nullptr) {
+      *numConsumed = numProcessed;
+    }
+  };
   while (true) {
     // Try to decrement the eventfd.
     //
@@ -658,6 +680,7 @@ void NotificationQueue<MessageT>::Consumer::consumeMessages(
       CHECK(destroyedFlagPtr_ == nullptr);
       destroyedFlagPtr_ = &callbackDestroyed;
       messageAvailable(std::move(msg));
+      destroyedFlagPtr_ = nullptr;
 
       RequestContext::setContext(old_ctx);
 
@@ -665,7 +688,6 @@ void NotificationQueue<MessageT>::Consumer::consumeMessages(
       if (callbackDestroyed) {
         return;
       }
-      destroyedFlagPtr_ = nullptr;
 
       // If the callback is no longer installed, we are done.
       if (queue_ == nullptr) {
@@ -762,7 +784,9 @@ void NotificationQueue<MessageT>::Consumer::stopConsuming() {
 }
 
 template<typename MessageT>
-bool NotificationQueue<MessageT>::Consumer::consumeUntilDrained() noexcept {
+bool NotificationQueue<MessageT>::Consumer::consumeUntilDrained(
+    size_t* numConsumed) noexcept {
+  DestructorGuard dg(this);
   {
     folly::SpinLockGuard g(queue_->spinlock_);
     if (queue_->draining_) {
@@ -770,12 +794,57 @@ bool NotificationQueue<MessageT>::Consumer::consumeUntilDrained() noexcept {
     }
     queue_->draining_ = true;
   }
-  consumeMessages(true);
+  consumeMessages(true, numConsumed);
   {
     folly::SpinLockGuard g(queue_->spinlock_);
     queue_->draining_ = false;
   }
   return true;
+}
+
+/**
+ * Creates a NotificationQueue::Consumer wrapping a function object
+ * Modeled after AsyncTimeout::make
+ *
+ */
+
+namespace detail {
+
+template <typename MessageT, typename TCallback>
+struct notification_queue_consumer_wrapper
+    : public NotificationQueue<MessageT>::Consumer {
+
+  template <typename UCallback>
+  explicit notification_queue_consumer_wrapper(UCallback&& callback)
+      : callback_(std::forward<UCallback>(callback)) {}
+
+  // we are being stricter here and requiring noexcept for callback
+  void messageAvailable(MessageT&& message) override {
+    static_assert(
+      noexcept(std::declval<TCallback>()(std::forward<MessageT>(message))),
+      "callback must be declared noexcept, e.g.: `[]() noexcept {}`"
+    );
+
+    callback_(std::forward<MessageT>(message));
+  }
+
+ private:
+  TCallback callback_;
+};
+
+} // namespace detail
+
+template <typename MessageT>
+template <typename TCallback>
+std::unique_ptr<typename NotificationQueue<MessageT>::Consumer,
+                DelayedDestruction::Destructor>
+NotificationQueue<MessageT>::Consumer::make(TCallback&& callback) {
+  return std::unique_ptr<NotificationQueue<MessageT>::Consumer,
+                         DelayedDestruction::Destructor>(
+      new detail::notification_queue_consumer_wrapper<
+          MessageT,
+          typename std::decay<TCallback>::type>(
+          std::forward<TCallback>(callback)));
 }
 
 } // folly

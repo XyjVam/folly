@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,15 @@
 #error This file may only be included from Format.h.
 #endif
 
+#include <array>
+#include <cinttypes>
+#include <deque>
+#include <map>
+#include <unordered_map>
+#include <vector>
+
 #include <folly/Exception.h>
+#include <folly/FormatTraits.h>
 #include <folly/Traits.h>
 
 // Ignore -Wformat-nonliteral warnings within this file
@@ -155,54 +163,9 @@ BaseFormatter<Derived, containerMode, Args...>::BaseFormatter(StringPiece str,
 }
 
 template <class Derived, bool containerMode, class... Args>
-void BaseFormatter<Derived, containerMode, Args...>::handleFormatStrError()
-    const {
-  if (crashOnError_) {
-    LOG(FATAL) << "folly::format: bad format string \"" << str_ << "\": " <<
-      folly::exceptionStr(std::current_exception());
-  }
-  throw;
-}
-
-template <class Derived, bool containerMode, class... Args>
 template <class Output>
 void BaseFormatter<Derived, containerMode, Args...>::operator()(Output& out)
     const {
-  // Catch BadFormatArg and range_error exceptions, and call
-  // handleFormatStrError().
-  //
-  // These exception types indicate a problem with the format string.  Most
-  // format strings are string literals specified by the programmer.  If they
-  // have a problem, this is usually a programmer bug.  We want to crash to
-  // ensure that these are found early on during development.
-  //
-  // BadFormatArg is thrown by the Format.h code, while range_error is thrown
-  // by Conv.h, which is used in several places in our format string
-  // processing.
-  //
-  // (Note: This behavior is slightly dangerous.  If the Output object throws a
-  // BadFormatArg or a range_error, we will also crash the program, even if it
-  // wasn't an issue with the format string.  This seems highly unlikely
-  // though, and none of our current Output objects can throw these errors.)
-  //
-  // We also throw out_of_range errors if the format string references an
-  // argument that isn't present (or a key that isn't present in one of the
-  // argument containers).  However, at the moment we don't crash on these
-  // errors, as it is likely that the container is dynamic at runtime.
-  try {
-    appendOutput(out);
-  } catch (const BadFormatArg& ex) {
-    handleFormatStrError();
-  } catch (const std::range_error& ex) {
-    handleFormatStrError();
-  }
-}
-
-template <class Derived, bool containerMode, class... Args>
-template <class Output>
-void BaseFormatter<Derived, containerMode, Args...>::appendOutput(Output& out)
-    const {
-
   // Copy raw string (without format specifiers) to output;
   // not as simple as we'd like, as we still need to translate "}}" to "}"
   // and throw if we see any lone "}"
@@ -263,6 +226,8 @@ void BaseFormatter<Derived, containerMode, Args...>::appendOutput(Output& out)
     int argIndex = 0;
     auto piece = arg.splitKey<true>();  // empty key component is okay
     if (containerMode) {  // static
+      arg.enforce(arg.width != FormatArg::kDynamicWidth,
+                  "dynamic field width not supported in vformat()");
       if (piece.empty()) {
         arg.setNextIntKey(nextArg++);
         hasDefaultArgIndex = true;
@@ -272,9 +237,22 @@ void BaseFormatter<Derived, containerMode, Args...>::appendOutput(Output& out)
       }
     } else {
       if (piece.empty()) {
+        if (arg.width == FormatArg::kDynamicWidth) {
+          arg.enforce(arg.widthIndex == FormatArg::kNoIndex,
+                      "cannot provide width arg index without value arg index");
+          int sizeArg = nextArg++;
+          arg.width = getSizeArg(sizeArg, arg);
+        }
+
         argIndex = nextArg++;
         hasDefaultArgIndex = true;
       } else {
+        if (arg.width == FormatArg::kDynamicWidth) {
+          arg.enforce(arg.widthIndex != FormatArg::kNoIndex,
+                      "cannot provide value arg index without width arg index");
+          arg.width = getSizeArg(arg.widthIndex, arg);
+        }
+
         try {
           argIndex = to<int>(piece);
         } catch (const std::out_of_range& e) {
@@ -440,6 +418,11 @@ class FormatValue<
   {
  public:
   explicit FormatValue(T val) : val_(val) { }
+
+  T getValue() const {
+    return val_;
+  }
+
   template <class FormatCallback>
   void format(FormatArg& arg, FormatCallback& cb) const {
     arg.validate(FormatArg::Type::INTEGER);
@@ -498,7 +481,7 @@ class FormatValue<
 
     int prefixLen = 0;
     switch (presentation) {
-    case 'n':
+    case 'n': {
       arg.enforce(!arg.basePrefix,
                   "base prefix not allowed with '", presentation,
                   "' specifier");
@@ -508,9 +491,30 @@ class FormatValue<
                   "' specifier");
 
       valBufBegin = valBuf + 3;  // room for sign and base prefix
-      valBufEnd = valBufBegin + sprintf(valBufBegin, "%'ju",
-                                        static_cast<uintmax_t>(uval));
+#ifdef _MSC_VER
+      char valBuf2[valBufSize];
+      snprintf(valBuf2, valBufSize, "%ju", static_cast<uintmax_t>(uval));
+      int len = GetNumberFormat(
+        LOCALE_USER_DEFAULT,
+        0,
+        valBuf2,
+        nullptr,
+        valBufBegin,
+        (int)((valBuf + valBufSize) - valBufBegin)
+      );
+#elif defined(__ANDROID__)
+      int len = snprintf(valBufBegin, (valBuf + valBufSize) - valBufBegin,
+                         "%" PRIuMAX, static_cast<uintmax_t>(uval));
+#else
+      int len = snprintf(valBufBegin, (valBuf + valBufSize) - valBufBegin,
+                         "%'ju", static_cast<uintmax_t>(uval));
+#endif
+      // valBufSize should always be big enough, so this should never
+      // happen.
+      assert(len < valBuf + valBufSize - valBufBegin);
+      valBufEnd = valBufBegin + len;
       break;
+    }
     case 'd':
       arg.enforce(!arg.basePrefix,
                   "base prefix not allowed with '", presentation,
@@ -631,135 +635,15 @@ class FormatValue<double> {
 
   template <class FormatCallback>
   void format(FormatArg& arg, FormatCallback& cb) const {
-    using ::double_conversion::DoubleToStringConverter;
-    using ::double_conversion::StringBuilder;
-
-    arg.validate(FormatArg::Type::FLOAT);
-
-    if (arg.presentation == FormatArg::kDefaultPresentation) {
-      arg.presentation = 'g';
-    }
-
-    const char* infinitySymbol = isupper(arg.presentation) ? "INF" : "inf";
-    const char* nanSymbol = isupper(arg.presentation) ? "NAN" : "nan";
-    char exponentSymbol = isupper(arg.presentation) ? 'E' : 'e';
-
-    if (arg.precision == FormatArg::kDefaultPrecision) {
-      arg.precision = 6;
-    }
-
-    // 2+: for null terminator and optional sign shenanigans.
-    char buf[2 + std::max({
-        (2 + DoubleToStringConverter::kMaxFixedDigitsBeforePoint +
-         DoubleToStringConverter::kMaxFixedDigitsAfterPoint),
-        (8 + DoubleToStringConverter::kMaxExponentialDigits),
-        (7 + DoubleToStringConverter::kMaxPrecisionDigits)})];
-    StringBuilder builder(buf + 1, static_cast<int> (sizeof(buf) - 1));
-
-    char plusSign;
-    switch (arg.sign) {
-    case FormatArg::Sign::PLUS_OR_MINUS:
-      plusSign = '+';
-      break;
-    case FormatArg::Sign::SPACE_OR_MINUS:
-      plusSign = ' ';
-      break;
-    default:
-      plusSign = '\0';
-      break;
-    };
-
-    auto flags =
-        DoubleToStringConverter::EMIT_POSITIVE_EXPONENT_SIGN |
-        (arg.trailingDot ? DoubleToStringConverter::EMIT_TRAILING_DECIMAL_POINT
-                         : 0);
-
-    double val = val_;
-    switch (arg.presentation) {
-    case '%':
-      val *= 100;
-    case 'f':
-    case 'F':
-      {
-        if (arg.precision >
-            DoubleToStringConverter::kMaxFixedDigitsAfterPoint) {
-          arg.precision = DoubleToStringConverter::kMaxFixedDigitsAfterPoint;
-        }
-        DoubleToStringConverter conv(flags,
-                                     infinitySymbol,
-                                     nanSymbol,
-                                     exponentSymbol,
-                                     -4,
-                                     arg.precision,
-                                     0,
-                                     0);
-        arg.enforce(conv.ToFixed(val, arg.precision, &builder),
-                    "fixed double conversion failed");
-      }
-      break;
-    case 'e':
-    case 'E':
-      {
-        if (arg.precision > DoubleToStringConverter::kMaxExponentialDigits) {
-          arg.precision = DoubleToStringConverter::kMaxExponentialDigits;
-        }
-
-        DoubleToStringConverter conv(flags,
-                                     infinitySymbol,
-                                     nanSymbol,
-                                     exponentSymbol,
-                                     -4,
-                                     arg.precision,
-                                     0,
-                                     0);
-        arg.enforce(conv.ToExponential(val, arg.precision, &builder));
-      }
-      break;
-    case 'n':  // should be locale-aware, but isn't
-    case 'g':
-    case 'G':
-      {
-        if (arg.precision < DoubleToStringConverter::kMinPrecisionDigits) {
-          arg.precision = DoubleToStringConverter::kMinPrecisionDigits;
-        } else if (arg.precision >
-                   DoubleToStringConverter::kMaxPrecisionDigits) {
-          arg.precision = DoubleToStringConverter::kMaxPrecisionDigits;
-        }
-        DoubleToStringConverter conv(flags,
-                                     infinitySymbol,
-                                     nanSymbol,
-                                     exponentSymbol,
-                                     -4,
-                                     arg.precision,
-                                     0,
-                                     0);
-        arg.enforce(conv.ToShortest(val, &builder));
-      }
-      break;
-    default:
-      arg.error("invalid specifier '", arg.presentation, "'");
-    }
-
-    int len = builder.position();
-    builder.Finalize();
-    DCHECK_GT(len, 0);
-
-    // Add '+' or ' ' sign if needed
-    char* p = buf + 1;
-    // anything that's neither negative nor nan
-    int prefixLen = 0;
-    if (plusSign && (*p != '-' && *p != 'n' && *p != 'N')) {
-      *--p = plusSign;
-      ++len;
-      prefixLen = 1;
-    } else if (*p == '-') {
-      prefixLen = 1;
-    }
-
-    format_value::formatNumber(StringPiece(p, len), prefixLen, arg, cb);
+    fbstring piece;
+    int prefixLen;
+    formatHelper(piece, prefixLen, arg);
+    format_value::formatNumber(piece, prefixLen, arg, cb);
   }
 
  private:
+  void formatHelper(fbstring& piece, int& prefixLen, FormatArg& arg) const;
+
   double val_;
 };
 
@@ -887,7 +771,9 @@ template <class T, class = void>
 class TryFormatValue {
  public:
   template <class FormatCallback>
-  static void formatOrFail(T& value, FormatArg& arg, FormatCallback& cb) {
+  static void formatOrFail(T& /* value */,
+                           FormatArg& arg,
+                           FormatCallback& /* cb */) {
     arg.error("No formatter available for this type");
   }
 };
@@ -930,45 +816,6 @@ class FormatValue<
 
 namespace detail {
 
-// Shortcut, so we don't have to use enable_if everywhere
-struct FormatTraitsBase {
-  typedef void enabled;
-};
-
-// Traits that define enabled, value_type, and at() for anything
-// indexable with integral keys: pointers, arrays, vectors, and maps
-// with integral keys
-template <class T, class Enable=void> struct IndexableTraits;
-
-// Base class for sequences (vectors, deques)
-template <class C>
-struct IndexableTraitsSeq : public FormatTraitsBase {
-  typedef C container_type;
-  typedef typename C::value_type value_type;
-  static const value_type& at(const C& c, int idx) {
-    return c.at(idx);
-  }
-
-  static const value_type& at(const C& c, int idx,
-                              const value_type& dflt) {
-    return (idx >= 0 && size_t(idx) < c.size()) ? c.at(idx) : dflt;
-  }
-};
-
-// Base class for associative types (maps)
-template <class C>
-struct IndexableTraitsAssoc : public FormatTraitsBase {
-  typedef typename C::value_type::second_type value_type;
-  static const value_type& at(const C& c, int idx) {
-    return c.at(static_cast<typename C::key_type>(idx));
-  }
-  static const value_type& at(const C& c, int idx,
-                              const value_type& dflt) {
-    auto pos = c.find(static_cast<typename C::key_type>(idx));
-    return pos != c.end() ? pos->second : dflt;
-  }
-};
-
 // std::array
 template <class T, size_t N>
 struct IndexableTraits<std::array<T, N>>
@@ -985,18 +832,6 @@ struct IndexableTraits<std::vector<T, A>>
 template <class T, class A>
 struct IndexableTraits<std::deque<T, A>>
   : public IndexableTraitsSeq<std::deque<T, A>> {
-};
-
-// fbvector
-template <class T, class A>
-struct IndexableTraits<fbvector<T, A>>
-  : public IndexableTraitsSeq<fbvector<T, A>> {
-};
-
-// small_vector
-template <class T, size_t M, class A, class B, class C>
-struct IndexableTraits<small_vector<T, M, A, B, C>>
-  : public IndexableTraitsSeq<small_vector<T, M, A, B, C>> {
 };
 
 // std::map with integral keys
@@ -1214,8 +1049,8 @@ class FormatValue<std::tuple<Args...>> {
   static constexpr size_t valueCount = std::tuple_size<Tuple>::value;
 
   template <size_t K, class Callback>
-  typename std::enable_if<K == valueCount>::type
-  doFormatFrom(size_t i, FormatArg& arg, Callback& cb) const {
+  typename std::enable_if<K == valueCount>::type doFormatFrom(
+      size_t i, FormatArg& arg, Callback& /* cb */) const {
     arg.enforce("tuple index out of range, max=", i);
   }
 

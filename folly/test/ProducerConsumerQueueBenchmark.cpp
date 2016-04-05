@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Facebook, Inc.
+ * Copyright 2016 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -204,7 +204,7 @@ void BM_ProducerConsumerAffinity(int iters, int size) {
   delete test;
 }
 
-void BM_ProducerConsumerLatency(int iters, int size) {
+void BM_ProducerConsumerLatency(int /* iters */, int size) {
   BenchmarkSuspender susp;
   CHECK_GT(size, 0);
   LatencyTest<LatencyQueueType> *test =
